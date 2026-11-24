@@ -2,7 +2,16 @@ import type { CapabilitiesObject, DeliveryMode, Direction, NodeKind } from "./ty
 
 export const AEP_CORE_STATIC_CAPABILITIES: CapabilitiesObject = {
   profile: "aep-core-static",
-  nodeKinds: ["ou", "interface", "structure", "content", "input"],
+  nodeKinds: [
+    "ou",
+    "interface",
+    "structure",
+    "component",
+    "document",
+    "view",
+    "editable",
+    "control",
+  ],
   channelDirections: [],
   deliveryModes: [],
   queries: {
@@ -26,7 +35,17 @@ export const AEP_CORE_STATIC_CAPABILITIES: CapabilitiesObject = {
 
 export const AEP_CORE_STREAMING_CAPABILITIES: CapabilitiesObject = {
   profile: "aep-core-streaming",
-  nodeKinds: ["ou", "interface", "channel", "structure", "content", "input"],
+  nodeKinds: [
+    "ou",
+    "interface",
+    "channel",
+    "structure",
+    "component",
+    "document",
+    "view",
+    "editable",
+    "control",
+  ],
   channelDirections: ["sense", "act", "duplex"],
   deliveryModes: ["stream", "stream+seek"],
   queries: {
@@ -201,8 +220,11 @@ export function negotiateCapabilities(
     nodeKinds.includes("ou") &&
     nodeKinds.includes("interface") &&
     nodeKinds.includes("structure") &&
-    nodeKinds.includes("content") &&
-    nodeKinds.includes("input") &&
+    nodeKinds.includes("component") &&
+    nodeKinds.includes("document") &&
+    nodeKinds.includes("view") &&
+    nodeKinds.includes("editable") &&
+    nodeKinds.includes("control") &&
     channelDirections.length === 3 &&
     deliveryModes.length === 2 &&
     dataPlane.binaryReferences &&

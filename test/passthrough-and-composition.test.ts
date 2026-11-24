@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { AEP_ERROR_CODES, AepError } from "aep-node";
+import { AEP_ERROR_CODES, AepError, type AepNode } from "aep-node";
 import { AepClient, AepCompositeClient } from "aep-node/client";
 import { AepServer } from "aep-node/server";
 import { MemoryTransportHub, createMemoryTransportPair } from "aep-node/transport";
@@ -15,6 +15,14 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
           id: "term",
           kind: "interface",
           type: "desktop.terminal",
+          properties: {
+            capture: {
+              binary: true,
+              mediaType: "image/png",
+              refId: "snapshot-1",
+              regionSupported: true,
+            },
+          },
           children: [
             {
               id: "term-out",
@@ -26,25 +34,42 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
             },
             {
               id: "term-link",
-              kind: "content",
-              mediaType: "text/plain",
-              temporalMode: "dynamic",
-              channelRef: "/term/term-out",
+              kind: "view",
+              type: "text",
+              properties: {
+                mediaType: "text/plain",
+                temporalMode: "dynamic",
+              },
+              state: {
+                channelRef: "/term/term-out",
+              },
             },
             {
               id: "scrollback",
-              kind: "content",
+              kind: "view",
               type: "desktop.textLog",
-              mediaType: "text/plain",
-              temporalMode: "dynamic",
-              value: "ready",
+              properties: {
+                mediaType: "text/plain",
+                temporalMode: "dynamic",
+              },
+              state: {
+                value: "ready",
+              },
             },
             {
               id: "stdin",
-              kind: "input",
+              kind: "editable",
               type: "desktop.commandInput",
-              mediaType: "text/plain",
-              methods: [{ name: "sendLine", sideEffects: "write" }],
+              properties: {
+                mediaType: "text/plain",
+              },
+              state: {
+                value: "",
+              },
+              methods: [
+                { name: "setValue", sideEffects: "write" },
+                { name: "sendLine", sideEffects: "write" },
+              ],
             },
           ],
         },
@@ -58,7 +83,10 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
       const cmd = String((params as { text: string }).text);
       await ctx.updateNode("/term/scrollback", (prev) => ({
         ...prev,
-        ...(prev.kind === "content" ? { value: `ran:${cmd}:ok` } : {}),
+        state: {
+          ...(prev.state ?? {}),
+          value: `ran:${cmd}:ok`,
+        },
       }));
       return {
         ok: true,
@@ -73,20 +101,25 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
         {
           id: "preview",
           kind: "interface",
-          type: "web.iframe",
+          type: "page",
           children: [
             {
               id: "dom-root",
-              kind: "structure",
-              type: "web.page",
+              kind: "document",
+              properties: { editable: false },
               hasChildren: true,
             },
             {
               id: "preview-shot",
-              kind: "content",
-              mediaType: "image/png",
-              temporalMode: "static",
-              binaryRef: { refId: "snapshot-1", mediaType: "image/png" },
+              kind: "view",
+              type: "image",
+              properties: {
+                mediaType: "image/png",
+                temporalMode: "static",
+              },
+              state: {
+                binaryRef: { refId: "snapshot-1", mediaType: "image/png" },
+              },
             },
           ],
         },
@@ -96,9 +129,29 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
       { refId: "snapshot-1", mediaType: "image/png" },
       new TextEncoder().encode("web-png"),
     );
-    webServer.registerChildrenLoader("/preview/dom-root", () => [
-      { id: "header", kind: "content", type: "web.header", mediaType: "text/plain", temporalMode: "static", value: "Docs" },
-      { id: "btn", kind: "input", type: "web.button", mediaType: "text/plain", value: "Go" },
+    webServer.registerChildrenLoader("/preview/dom-root", (): AepNode[] => [
+      {
+        id: "header",
+        kind: "structure",
+        type: "heading",
+        properties: { level: 1 },
+        children: [
+          {
+            id: "title",
+            kind: "view",
+            type: "text",
+            properties: { mediaType: "text/plain", temporalMode: "static" },
+            state: { value: "Docs" },
+          },
+        ],
+      },
+      {
+        id: "btn",
+        kind: "control",
+        type: "button",
+        properties: { label: "Go" },
+        methods: [{ name: "invoke", sideEffects: "write" }],
+      },
     ]);
 
     // 3. Desktop IDE host server
@@ -113,19 +166,21 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
             {
               id: "ide",
               kind: "interface",
-              type: "desktop.window",
+              type: "window",
+              properties: { title: "IDE" },
               children: [
                 {
                   id: "layout",
                   kind: "structure",
-                  type: "desktop.panel",
+                  type: "grid",
+                  properties: { columns: 3 },
                   children: [
                     {
                       id: "editor",
-                      kind: "input",
-                      type: "desktop.textField",
-                      mediaType: "text/plain",
-                      value: "fn main() {}",
+                      kind: "editable",
+                      type: "textArea",
+                      properties: { mediaType: "text/plain" },
+                      state: { value: "fn main() {}" },
                     },
                     {
                       id: "term",
@@ -135,7 +190,7 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
                     {
                       id: "preview",
                       kind: "interface",
-                      type: "web.iframe",
+                      type: "page",
                     },
                   ],
                 },
@@ -174,7 +229,7 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
     // tree.query spans local + mounted providers
     const queryRes = await agent.queryTree({
       rootPath: "/workstation/ide",
-      kinds: ["interface", "input"],
+      kinds: ["interface", "editable"],
     });
     const matchedPaths = queryRes.matches.map((m) => m.path);
     assert.ok(matchedPaths.includes("/workstation/ide/layout/editor"));
@@ -182,12 +237,18 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
     assert.ok(matchedPaths.includes("/workstation/ide/layout/term/stdin"));
     assert.ok(matchedPaths.includes("/workstation/ide/layout/preview"));
 
-    // ChannelRef inside mounted terminal was rewritten to upstream path
-    const termLink = await agent.getNode("/workstation/ide/layout/term/term-link");
-    assert.equal(termLink.node.kind, "content");
-    assert.equal(termLink.node.channelRef, "/workstation/ide/layout/term/term-out");
+    // state.channelRef and properties.capture.refId inside mounted terminal were rewritten upstream
+    const termNode = await agent.getNode("/workstation/ide/layout/term", { maxDepth: 0 });
+    const termCapRef = (termNode.node.properties?.["capture"] as { refId?: string } | undefined)?.refId;
+    assert.ok(termCapRef && termCapRef !== "snapshot-1");
+    const termCapBin = await agent.getBinary(termCapRef);
+    assert.equal(new TextDecoder().decode(termCapBin.data), "term-png");
 
-    // Lazy mount hydrates on loadChildren, and lazy DOM inside mount loads children
+    const termLink = await agent.getNode("/workstation/ide/layout/term/term-link");
+    assert.equal(termLink.node.kind, "view");
+    assert.equal(termLink.node.state?.channelRef, "/workstation/ide/layout/term/term-out");
+
+    // Lazy mount hydrates on loadChildren, and lazy document inside mount loads children
     const previewChildren = await agent.loadChildren("/workstation/ide/layout/preview");
     assert.equal(previewChildren.children.length, 2);
     const domChildren = await agent.loadChildren("/workstation/ide/layout/preview/dom-root");
@@ -201,7 +262,7 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
     agent.onNodeUpdated((ev) => {
       updates.push({
         path: ev.path,
-        value: ev.node.kind === "content" ? ev.node.value : undefined,
+        value: ev.node.state?.value,
       });
     });
 
@@ -224,8 +285,8 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
 
     // Distinct BinaryRef isolation despite identical local refId "snapshot-1"
     const webShotNode = await agent.getNode("/workstation/ide/layout/preview/preview-shot");
-    assert.equal(webShotNode.node.kind, "content");
-    const webRefId = webShotNode.node.binaryRef!.refId;
+    assert.equal(webShotNode.node.kind, "view");
+    const webRefId = webShotNode.node.state!.binaryRef!.refId;
     assert.notEqual(webRefId, invokeRes.result.snapshot.refId);
 
     const termBin = await agent.getBinary(invokeRes.result.snapshot.refId);
@@ -382,8 +443,9 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
           children: [
             {
               id: "ctrl",
-              kind: "input",
-              mediaType: "text/plain",
+              kind: "editable",
+              type: "textField",
+              properties: { mediaType: "text/plain" },
               methods: [{ name: "mutate", sideEffects: "write" }],
             },
             {
@@ -395,9 +457,9 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
             },
             {
               id: "slow",
-              kind: "content",
-              mediaType: "text/plain",
-              temporalMode: "static",
+              kind: "view",
+              type: "text",
+              properties: { mediaType: "text/plain", temporalMode: "static" },
               methods: [{ name: "hang", sideEffects: "read" }],
             },
           ],
@@ -491,5 +553,105 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
     await downstream.close();
     await srvA.close();
     await srvB.close();
+  });
+
+  it("mounts a remote ComponentElement owning a Channel into a host StructureElement grid slot and rewrites state.channelRef", async () => {
+    const playerServer = new AepServer({
+      body: [
+        {
+          id: "win",
+          kind: "interface",
+          type: "window",
+          children: [
+            {
+              id: "player",
+              kind: "component",
+              type: "media.videoPlayer",
+              state: { playbackState: "paused" },
+              children: [
+                {
+                  id: "video-out",
+                  kind: "channel",
+                  mediaType: "video/h264",
+                  direction: "sense",
+                  deliveryMode: "stream+seek",
+                  streamRef: {
+                    refId: "vid-stream",
+                    mediaType: "video/h264",
+                    seek: { seekable: true, unit: "ms" },
+                  },
+                },
+                {
+                  id: "viewport",
+                  kind: "view",
+                  type: "videoSurface",
+                  state: { channelRef: "/win/player/video-out" },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    playerServer.registerChannel("/win/player/video-out", {
+      async onOpen(ctx) {
+        await ctx.sendChunk({ data: new Uint8Array([0xde, 0xad, 0xbe, 0xef]), offset: 0 });
+      },
+    });
+
+    const hostServer = new AepServer({
+      body: [
+        {
+          id: "host",
+          kind: "ou",
+          children: [
+            {
+              id: "win",
+              kind: "interface",
+              type: "window",
+              children: [
+                {
+                  id: "grid",
+                  kind: "structure",
+                  type: "grid",
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    const [downCt, downSt] = createMemoryTransportPair();
+    playerServer.accept(downSt);
+    await hostServer.mount({
+      anchorPath: "/host/win/grid/player",
+      sourcePath: "/win/player",
+      client: new AepClient(downCt),
+      mountKey: "player",
+    });
+
+    const [agentCt, agentSt] = createMemoryTransportPair();
+    hostServer.accept(agentSt);
+    const agent = await AepClient.connect(agentCt);
+
+    const viewport = await agent.getNode("/host/win/grid/player/viewport");
+    assert.equal(viewport.node.kind, "view");
+    assert.equal(viewport.node.state?.channelRef, "/host/win/grid/player/video-out");
+
+    const videoNode = await agent.getNode("/host/win/grid/player/video-out");
+    assert.equal(videoNode.node.kind, "channel");
+    assert.notEqual(videoNode.node.streamRef?.refId, "vid-stream");
+
+    const sub = await agent.openChannel({ path: viewport.node.state!.channelRef! });
+    const frames: number[][] = [];
+    sub.onChunk((c) => frames.push([...c.data]));
+    await new Promise((r) => setTimeout(r, 15));
+    assert.deepEqual(frames, [[0xde, 0xad, 0xbe, 0xef]]);
+
+    await sub.close();
+    await agent.close();
+    await hostServer.close();
+    await playerServer.close();
   });
 });

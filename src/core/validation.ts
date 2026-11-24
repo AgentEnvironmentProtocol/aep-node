@@ -6,56 +6,217 @@ import type {
   BodyRoot,
   CapabilitiesObject,
   ChannelNode,
-  ContentElementNode,
   EventDecl,
-  InputElementNode,
   MethodDecl,
   NodeKind,
   Path,
 } from "./types.js";
 
+const ELEMENT_KINDS: readonly NodeKind[] = [
+  "structure",
+  "component",
+  "document",
+  "view",
+  "editable",
+  "control",
+];
+
 const VALID_NODE_KINDS = new Set<NodeKind>([
   "ou",
   "interface",
   "channel",
-  "structure",
-  "content",
-  "input",
+  ...ELEMENT_KINDS,
 ]);
 
 const ALLOWED_CHILDREN: Record<NodeKind | "body", ReadonlySet<NodeKind>> = {
   body: new Set<NodeKind>(["ou", "interface", "channel"]),
   ou: new Set<NodeKind>(["ou", "interface", "channel"]),
-  interface: new Set<NodeKind>(["structure", "content", "input", "interface", "channel"]),
-  structure: new Set<NodeKind>(["structure", "content", "input", "interface"]),
-  content: new Set<NodeKind>(["structure", "content", "input"]),
-  input: new Set<NodeKind>(["structure", "content", "input"]),
+  interface: new Set<NodeKind>([...ELEMENT_KINDS, "interface", "channel"]),
+  structure: new Set<NodeKind>([...ELEMENT_KINDS, "interface"]),
+  component: new Set<NodeKind>([...ELEMENT_KINDS, "interface", "channel"]),
+  document: new Set<NodeKind>([...ELEMENT_KINDS, "interface"]),
+  view: new Set<NodeKind>(ELEMENT_KINDS),
+  editable: new Set<NodeKind>(ELEMENT_KINDS),
+  control: new Set<NodeKind>(ELEMENT_KINDS),
   channel: new Set<NodeKind>(),
 };
 
 const VALID_DIRECTIONS = new Set(["sense", "act", "duplex"]);
 const VALID_DELIVERY_MODES = new Set(["stream", "stream+seek"]);
 const VALID_TEMPORAL_MODES = new Set(["static", "dynamic"]);
+const VALID_ORIENTATIONS = new Set(["horizontal", "vertical"]);
 const VALID_SEEK_UNITS = new Set(["ms", "seconds", "frames", "bytes", "samples"]);
 const VALID_INVOCATION_MODES = new Set(["request-response", "notification"]);
 const VALID_SIDE_EFFECTS = new Set(["none", "read", "write"]);
+const BOOLEAN_PROPERTY_KEYS = ["disabled", "readonly", "required", "editable", "modal"] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateKeyValueMapKeys(
+  map: unknown,
+  fieldName: string,
+  context: string,
+): asserts map is Record<string, unknown> {
+  if (!isPlainObject(map)) {
+    throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, `${context}.${fieldName} must be an object`);
+  }
+  for (const key of Object.keys(map)) {
+    if (!isValidNamespacedIdent(key)) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `Invalid ${fieldName} key "${key}" in ${context}`,
+      );
+    }
+  }
 }
 
 function validateMetaMap(meta: unknown, context: string): void {
   if (meta === undefined) {
     return;
   }
-  if (!isPlainObject(meta)) {
-    throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, `${context}.meta must be an object`);
+  validateKeyValueMapKeys(meta, "meta", context);
+}
+
+function validatePropertiesMap(properties: unknown, context: string): void {
+  if (properties === undefined) {
+    return;
   }
-  for (const key of Object.keys(meta)) {
-    if (!isValidNamespacedIdent(key)) {
+  validateKeyValueMapKeys(properties, "properties", context);
+
+  const temporalMode = properties["temporalMode"];
+  if (
+    temporalMode !== undefined &&
+    (typeof temporalMode !== "string" || !VALID_TEMPORAL_MODES.has(temporalMode))
+  ) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `${context}.properties.temporalMode is invalid: "${String(temporalMode)}"`,
+    );
+  }
+
+  const mediaType = properties["mediaType"];
+  if (mediaType !== undefined && (typeof mediaType !== "string" || mediaType.length === 0)) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `${context}.properties.mediaType must be a non-empty string`,
+    );
+  }
+
+  const valueSchema = properties["valueSchema"];
+  if (valueSchema !== undefined && !isPlainObject(valueSchema)) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `${context}.properties.valueSchema must be an object`,
+    );
+  }
+
+  const orientation = properties["orientation"];
+  if (
+    orientation !== undefined &&
+    (typeof orientation !== "string" || !VALID_ORIENTATIONS.has(orientation))
+  ) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `${context}.properties.orientation is invalid: "${String(orientation)}"`,
+    );
+  }
+
+  for (const key of BOOLEAN_PROPERTY_KEYS) {
+    const val = properties[key];
+    if (val !== undefined && typeof val !== "boolean") {
       throw new AepError(
         AEP_ERROR_CODES.INVALID_MESSAGE,
-        `Invalid meta key "${key}" in ${context}`,
+        `${context}.properties.${key} must be a boolean`,
+      );
+    }
+  }
+
+  const bounds = properties["bounds"];
+  if (bounds !== undefined) {
+    if (
+      !isPlainObject(bounds) ||
+      typeof bounds["x"] !== "number" ||
+      !Number.isFinite(bounds["x"]) ||
+      typeof bounds["y"] !== "number" ||
+      !Number.isFinite(bounds["y"]) ||
+      typeof bounds["width"] !== "number" ||
+      !Number.isFinite(bounds["width"]) ||
+      bounds["width"] < 0 ||
+      typeof bounds["height"] !== "number" ||
+      !Number.isFinite(bounds["height"]) ||
+      bounds["height"] < 0
+    ) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `${context}.properties.bounds requires finite x, y, width >= 0, height >= 0`,
+      );
+    }
+  }
+}
+
+function validateStateMap(state: unknown, kind: NodeKind, context: string): void {
+  if (state === undefined) {
+    return;
+  }
+  validateKeyValueMapKeys(state, "state", context);
+
+  if (state["binaryRef"] !== undefined) {
+    validateBinaryRef(state["binaryRef"], `${context}.state`);
+  }
+
+  const channelRef = state["channelRef"];
+  if (channelRef !== undefined && (typeof channelRef !== "string" || !isValidPath(channelRef))) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_REFERENCE,
+      `${context}.state has malformed channelRef "${String(channelRef)}"`,
+    );
+  }
+
+  if (kind === "control" && state["value"] !== undefined) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `Control node "${context}" is strictly stateless and MUST NOT hold state.value`,
+    );
+  }
+
+  if (kind === "view") {
+    const bindingCount =
+      (state["value"] !== undefined ? 1 : 0) +
+      (state["binaryRef"] !== undefined ? 1 : 0) +
+      (state["channelRef"] !== undefined ? 1 : 0);
+    if (bindingCount > 1) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `View node "${context}" MUST specify at most one of state.value, state.binaryRef, or state.channelRef`,
+      );
+    }
+  }
+}
+
+function validateTabularChild(
+  parentKind: NodeKind | "body",
+  parentType: string | undefined,
+  childKind: NodeKind,
+  childType: string | undefined,
+  context: string,
+): void {
+  if (parentKind !== "structure") {
+    return;
+  }
+  if (parentType === "table") {
+    if (childKind !== "structure" || (childType !== "column" && childType !== "row")) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `Table node child "${context}" MUST have kind "structure" and type "column" or "row"`,
+      );
+    }
+  } else if (parentType === "row") {
+    if (childKind !== "structure" || childType !== "cell") {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `Table row child "${context}" MUST have kind "structure" and type "cell"`,
       );
     }
   }
@@ -238,62 +399,6 @@ function validateChannelNode(node: ChannelNode, context: string): void {
   if (node.streamRef !== undefined) {
     validateStreamRef(node.streamRef, context);
   }
-  validateMetaMap(node.streamMeta, `${context}.streamMeta`);
-}
-
-function validateContentNode(node: ContentElementNode, context: string): void {
-  if (typeof node.mediaType !== "string" || node.mediaType.length === 0) {
-    throw new AepError(
-      AEP_ERROR_CODES.INVALID_MESSAGE,
-      `Content node "${context}" requires a non-empty mediaType`,
-    );
-  }
-  if (!VALID_TEMPORAL_MODES.has(node.temporalMode)) {
-    throw new AepError(
-      AEP_ERROR_CODES.INVALID_MESSAGE,
-      `Content node "${context}" has invalid temporalMode "${String(node.temporalMode)}"`,
-    );
-  }
-  const bindingCount =
-    (node.value !== undefined ? 1 : 0) +
-    (node.binaryRef !== undefined ? 1 : 0) +
-    (node.channelRef !== undefined ? 1 : 0);
-  if (bindingCount > 1) {
-    throw new AepError(
-      AEP_ERROR_CODES.INVALID_MESSAGE,
-      `Content node "${context}" MUST specify at most one of value, binaryRef, or channelRef`,
-    );
-  }
-  if (node.binaryRef !== undefined) {
-    validateBinaryRef(node.binaryRef, context);
-  }
-  if (node.channelRef !== undefined && (typeof node.channelRef !== "string" || !isValidPath(node.channelRef))) {
-    throw new AepError(
-      AEP_ERROR_CODES.INVALID_REFERENCE,
-      `Content node "${context}" has malformed channelRef "${String(node.channelRef)}"`,
-    );
-  }
-}
-
-function validateInputNode(node: InputElementNode, context: string): void {
-  if (typeof node.mediaType !== "string" || node.mediaType.length === 0) {
-    throw new AepError(
-      AEP_ERROR_CODES.INVALID_MESSAGE,
-      `Input node "${context}" requires a non-empty mediaType`,
-    );
-  }
-  if (node.inputSchema !== undefined && !isPlainObject(node.inputSchema)) {
-    throw new AepError(
-      AEP_ERROR_CODES.INVALID_MESSAGE,
-      `Input node "${context}" inputSchema must be an object`,
-    );
-  }
-  if (node.channelRef !== undefined && (typeof node.channelRef !== "string" || !isValidPath(node.channelRef))) {
-    throw new AepError(
-      AEP_ERROR_CODES.INVALID_REFERENCE,
-      `Input node "${context}" has malformed channelRef "${String(node.channelRef)}"`,
-    );
-  }
 }
 
 export function validateNode(
@@ -301,6 +406,7 @@ export function validateNode(
   parentKind: NodeKind | "body",
   ancestors: Set<object> = new Set<object>(),
   parentPath: Path = "/",
+  parentType?: string,
 ): void {
   if (!isPlainObject(node)) {
     throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, `Node under "${parentPath}" must be an object`);
@@ -337,6 +443,8 @@ export function validateNode(
       `Invalid TypeTag "${String(node.type)}" at "${nodePath}"`,
     );
   }
+  validateTabularChild(parentKind, parentType, node.kind, node.type, nodePath);
+
   if (node.hasChildren !== undefined && typeof node.hasChildren !== "boolean") {
     throw new AepError(
       AEP_ERROR_CODES.INVALID_MESSAGE,
@@ -344,6 +452,8 @@ export function validateNode(
     );
   }
 
+  validatePropertiesMap(node.properties, nodePath);
+  validateStateMap(node.state, node.kind, nodePath);
   validateMetaMap(node.meta, nodePath);
   validateMethodDecls(node.methods, nodePath);
   validateEventDecls(node.events, nodePath);
@@ -351,11 +461,6 @@ export function validateNode(
   if (node.kind === "channel") {
     validateChannelNode(node, nodePath);
     return;
-  }
-  if (node.kind === "content") {
-    validateContentNode(node, nodePath);
-  } else if (node.kind === "input") {
-    validateInputNode(node, nodePath);
   }
 
   const children = node.children as readonly AepNode[] | undefined;
@@ -373,7 +478,7 @@ export function validateNode(
   try {
     const siblingIds = new Set<string>();
     for (const child of children) {
-      validateNode(child, node.kind, ancestors, nodePath);
+      validateNode(child, node.kind, ancestors, nodePath, node.type);
       if (siblingIds.has(child.id)) {
         throw new AepError(
           AEP_ERROR_CODES.INVALID_MESSAGE,
@@ -422,25 +527,26 @@ export function validateChannelRefs(body: readonly BodyChild[], strict = false):
   const walk = (nodes: readonly AepNode[], parentPath: Path): void => {
     for (const node of nodes) {
       const nodePath = parentPath === "/" ? `/${node.id}` : `${parentPath}/${node.id}`;
-      if ((node.kind === "content" || node.kind === "input") && node.channelRef !== undefined) {
-        if (!isValidPath(node.channelRef)) {
+      const channelRef = node.state?.channelRef;
+      if (channelRef !== undefined) {
+        if (typeof channelRef !== "string" || !isValidPath(channelRef)) {
           throw new AepError(
             AEP_ERROR_CODES.INVALID_REFERENCE,
-            `Invalid channelRef "${node.channelRef}" on "${nodePath}"`,
+            `Invalid channelRef "${String(channelRef)}" on "${nodePath}"`,
           );
         }
-        const resolved = lookupPathWithLazyHint(body, node.channelRef);
+        const resolved = lookupPathWithLazyHint(body, channelRef);
         if (resolved.node) {
           if (resolved.node.kind !== "channel") {
             throw new AepError(
               AEP_ERROR_CODES.INVALID_REFERENCE,
-              `channelRef "${node.channelRef}" on "${nodePath}" resolves to kind "${resolved.node.kind}" instead of "channel"`,
+              `channelRef "${channelRef}" on "${nodePath}" resolves to kind "${resolved.node.kind}" instead of "channel"`,
             );
           }
         } else if (strict || !resolved.coveredByLazyAncestor) {
           throw new AepError(
             AEP_ERROR_CODES.INVALID_REFERENCE,
-            `channelRef "${node.channelRef}" on "${nodePath}" does not resolve to an existing channel`,
+            `channelRef "${channelRef}" on "${nodePath}" does not resolve to an existing channel`,
           );
         }
       }
@@ -488,6 +594,12 @@ export function validateNodeCapabilities(
       `Node "${path}" uses unsupported NodeKind "${node.kind}"`,
     );
   }
+  if (node.state?.binaryRef !== undefined && !capabilities.dataPlane.binaryReferences) {
+    throw new AepError(
+      AEP_ERROR_CODES.UNSUPPORTED_CAPABILITY,
+      `Node "${path}" uses state.binaryRef while binaryReferences capability is disabled`,
+    );
+  }
   if (node.kind === "channel") {
     if (!capabilities.channelDirections.includes(node.direction)) {
       throw new AepError(
@@ -509,12 +621,6 @@ export function validateNodeCapabilities(
     }
     return;
   }
-  if (node.kind === "content" && node.binaryRef !== undefined && !capabilities.dataPlane.binaryReferences) {
-    throw new AepError(
-      AEP_ERROR_CODES.UNSUPPORTED_CAPABILITY,
-      `Content node "${path}" uses binaryRef while binaryReferences capability is disabled`,
-    );
-  }
   if (node.children) {
     for (const child of node.children) {
       validateNodeCapabilities(child, capabilities, `${path}/${child.id}`);
@@ -534,19 +640,20 @@ export function validateBodyCapabilities(
 export function validateMountContainment(
   anchorKind: NodeKind | "body",
   target: BodyRoot | AepNode,
+  anchorType?: string,
 ): void {
   if (target.kind === "body") {
     if (anchorKind === "body" || anchorKind === "ou") {
       return;
     }
-    if (anchorKind === "interface") {
+    if (anchorKind === "interface" || anchorKind === "component") {
       const hasOu = target.children.some((child) => child.kind === "ou");
       if (!hasOu) {
         return;
       }
       throw new AepError(
         AEP_ERROR_CODES.INVALID_MESSAGE,
-        'Cannot mount a Body containing "ou" nodes under an "interface" anchor',
+        `Cannot mount a Body containing "ou" nodes under a "${anchorKind}" anchor`,
       );
     }
     throw new AepError(
@@ -561,4 +668,5 @@ export function validateMountContainment(
       `Cannot mount downstream node kind "${target.kind}" under anchor kind "${anchorKind}"`,
     );
   }
+  validateTabularChild(anchorKind, anchorType, target.kind, target.type, target.id);
 }

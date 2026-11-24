@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { AEP_ERROR_CODES, AepError, type BodyChild } from "aep-node";
+import { AEP_ERROR_CODES, AepError, type AepNode, type BodyChild } from "aep-node";
 import { AepClient } from "aep-node/client";
 import { AepServer } from "aep-node/server";
 import { createMemoryTransportPair } from "aep-node/transport";
@@ -11,7 +11,7 @@ function buildRichBody(): BodyChild[] {
       id: "workstation",
       kind: "ou",
       type: "desktop.host",
-      meta: { "aep.description": "Primary developer workstation" },
+      properties: { description: "Primary developer workstation" },
       children: [
         {
           id: "sys-audio",
@@ -47,26 +47,40 @@ function buildRichBody(): BodyChild[] {
         {
           id: "ide",
           kind: "interface",
-          type: "desktop.window",
-          meta: {
-            "aep.description": "Code editor window",
-            "aep.capture": { binary: true, mediaType: "image/png", refId: "bin-ide", regionSupported: true },
+          type: "window",
+          properties: {
+            title: "IDE Workspace",
+            description: "Code editor window",
+            capture: { binary: true, mediaType: "image/png", refId: "bin-ide", regionSupported: true },
           },
+          state: { windowState: "normal", focused: true },
           children: [
             {
               id: "title",
-              kind: "content",
+              kind: "view",
               type: "desktop.label",
-              mediaType: "text/plain",
-              temporalMode: "dynamic",
-              value: "main.ts - AEP",
+              properties: {
+                mediaType: "text/plain",
+                temporalMode: "dynamic",
+                label: "Active File",
+              },
+              state: {
+                value: "main.ts - AEP",
+              },
             },
             {
               id: "editor",
-              kind: "input",
-              type: "desktop.textField",
-              mediaType: "text/plain",
-              value: "console.log('hello');",
+              kind: "editable",
+              type: "textArea",
+              properties: {
+                mediaType: "text/plain",
+                label: "Code Editor",
+                valueSchema: { type: "string" },
+              },
+              state: {
+                value: "console.log('hello');",
+                dirty: false,
+              },
               methods: [
                 { name: "setValue", sideEffects: "write" },
                 { name: "getStats", sideEffects: "read" },
@@ -75,9 +89,17 @@ function buildRichBody(): BodyChild[] {
             },
             {
               id: "dom-lazy",
-              kind: "structure",
-              type: "web.page",
+              kind: "document",
+              properties: {
+                editable: false,
+                title: "Embedded Docs",
+              },
               hasChildren: true,
+            },
+            {
+              id: "metrics-table",
+              kind: "structure",
+              type: "table",
             },
           ],
         },
@@ -144,6 +166,17 @@ describe("Control Plane and Data Plane", () => {
     const client = await AepClient.connect(ct, { capabilities: "aep-core-static" });
 
     assert.equal(client.capabilities?.profile, "aep-core-static");
+    assert.deepEqual(client.capabilities?.nodeKinds, [
+      "ou",
+      "interface",
+      "structure",
+      "component",
+      "document",
+      "view",
+      "editable",
+      "control",
+    ]);
+    assert.equal(client.capabilities?.nodeKinds.includes("channel"), false);
     const bin = await client.getBinary("shot-1", {
       region: { x: 10, y: 20, width: 300, height: 200, coordSpace: "pixel" },
     });
@@ -168,39 +201,50 @@ describe("Control Plane and Data Plane", () => {
       body: buildRichBody(),
     });
 
-    server.registerChildrenLoader("/workstation/ide/dom-lazy", () => ({
-      children: [
+    server.registerChildrenLoader("/workstation/ide/dom-lazy", () => {
+      const children: AepNode[] = [
         {
           id: "header",
-          kind: "content",
-          type: "web.header",
-          mediaType: "text/plain",
-          temporalMode: "static",
-          value: "Welcome Header",
+          kind: "structure",
+          type: "heading",
+          properties: { level: 1 },
+          children: [
+            {
+              id: "text",
+              kind: "view",
+              type: "text",
+              properties: { mediaType: "text/plain", temporalMode: "static" },
+              state: { value: "Welcome Header" },
+            },
+          ],
         },
         {
           id: "btn",
-          kind: "input",
-          type: "web.button",
-          mediaType: "text/plain",
-          value: "Submit",
+          kind: "control",
+          type: "button",
+          properties: { label: "Submit" },
+          methods: [{ name: "invoke", sideEffects: "write" }],
         },
-      ],
-      hasMore: false,
-    }));
+      ];
+      return { children, hasMore: false };
+    });
 
     server.registerMethod("/workstation/ide/editor", "setValue", async (params, ctx) => {
       const nextVal = String((params as { value: string }).value);
       await ctx.updateNode(ctx.path, (prev) => ({
         ...prev,
-        ...(prev.kind === "input" ? { value: nextVal } : {}),
+        state: {
+          ...(prev.state ?? {}),
+          value: nextVal,
+          dirty: true,
+        },
       }));
       await ctx.emitEvent(ctx.path, "valueChanged", { value: nextVal });
       return { updated: true, value: nextVal };
     });
 
     server.registerMethod("/workstation/ide/editor", "getStats", (_params, ctx) => {
-      const val = ctx.node.kind === "input" && typeof ctx.node.value === "string" ? ctx.node.value : "";
+      const val = typeof ctx.node.state?.value === "string" ? ctx.node.state.value : "";
       return { length: val.length };
     });
 
@@ -225,13 +269,47 @@ describe("Control Plane and Data Plane", () => {
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.NODE_NOT_FOUND,
     );
 
-    // tree.query predicates
+    // tree.query predicates: wildcard types, built-in types, properties, state, mediaTypePrefix, textContains
     const wildcardQuery = await client.queryTree({
       types: ["desktop.*"],
       textContains: "main.ts",
     });
     assert.equal(wildcardQuery.totalCount, 1);
     assert.equal(wildcardQuery.matches[0]?.path, "/workstation/ide/title");
+
+    const builtInTypeQuery = await client.queryTree({
+      types: ["window", "textArea"],
+    });
+    assert.deepEqual(
+      builtInTypeQuery.matches.map((m) => m.path),
+      ["/workstation/ide", "/workstation/ide/editor"],
+    );
+
+    const propertiesQuery = await client.queryTree({
+      properties: [{ key: "editable", value: false }],
+    });
+    assert.equal(propertiesQuery.totalCount, 1);
+    assert.equal(propertiesQuery.matches[0]?.path, "/workstation/ide/dom-lazy");
+
+    const stateQuery = await client.queryTree({
+      state: [{ key: "dirty", value: false }],
+    });
+    assert.equal(stateQuery.totalCount, 1);
+    assert.equal(stateQuery.matches[0]?.path, "/workstation/ide/editor");
+
+    const textMediaMatches = await client.queryTree({
+      mediaTypePrefix: "text/",
+    });
+    assert.deepEqual(
+      textMediaMatches.matches.map((m) => m.path),
+      ["/workstation/ide/title", "/workstation/ide/editor"],
+    );
+
+    // textContains MUST NOT match unrelated property strings such as properties.mediaType ("text/plain")
+    const nonTextContainsMediaType = await client.queryTree({
+      textContains: "text/plain",
+    });
+    assert.equal(nonTextContainsMediaType.totalCount, 0);
 
     const senseChannels = await client.queryTree({
       kinds: ["channel"],
@@ -262,7 +340,40 @@ describe("Control Plane and Data Plane", () => {
     const loaded = await client.loadChildren("/workstation/ide/dom-lazy");
     assert.equal(loaded.children.length, 2);
     const domHeader = await client.getNode("/workstation/ide/dom-lazy/header");
-    assert.equal(domHeader.node.kind, "content");
+    assert.equal(domHeader.node.kind, "structure");
+    assert.equal(domHeader.node.type, "heading");
+
+    // Dynamic server.addNode & node.loadChildren enforce Invariant 9 on tables/rows
+    await assert.rejects(
+      () =>
+        server.addNode("/workstation/ide/metrics-table", {
+          id: "bad-child",
+          kind: "view",
+          type: "text",
+          state: { value: "invalid" },
+        }),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    const validRow = await server.addNode("/workstation/ide/metrics-table", {
+      id: "row-1",
+      kind: "structure",
+      type: "row",
+      hasChildren: true,
+    });
+    assert.equal(validRow.type, "row");
+
+    server.registerChildrenLoader("/workstation/ide/metrics-table/row-1", () => [
+      {
+        id: "bad-view",
+        kind: "view",
+        type: "text",
+      },
+    ]);
+    await assert.rejects(
+      () => client.loadChildren("/workstation/ide/metrics-table/row-1"),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
 
     // Live events and syncTree mirroring
     const events: string[] = [];
@@ -289,10 +400,10 @@ describe("Control Plane and Data Plane", () => {
     // Verify live syncTree add/update/remove + head.updated
     await server.addNode("/workstation/ide", {
       id: "badge",
-      kind: "content",
-      mediaType: "text/plain",
-      temporalMode: "static",
-      value: "v2",
+      kind: "view",
+      type: "badge",
+      properties: { mediaType: "text/plain", temporalMode: "static" },
+      state: { value: "v2" },
     });
     await server.updateHead({ "vendor.mode": "active" });
 
@@ -424,6 +535,413 @@ describe("Control Plane and Data Plane", () => {
     }
     assert.deepEqual(replayChunks, [0, 42000]);
 
+    await client.close();
+    await server.close();
+  });
+
+  it("supports Scenario 4 composite Video Player Component and Rich Document with embedded fillable Form", async () => {
+    const server = new AepServer({
+      capabilities: "aep-core-streaming",
+      body: [
+        {
+          id: "training-win",
+          kind: "interface",
+          type: "window",
+          properties: { title: "Operator Training Module" },
+          state: { windowState: "normal", focused: true },
+          children: [
+            {
+              id: "main-split",
+              kind: "structure",
+              type: "grid",
+              properties: { columns: 2 },
+              children: [
+                {
+                  id: "player",
+                  kind: "component",
+                  type: "media.videoPlayer",
+                  state: { playbackState: "paused", positionMs: 0 },
+                  methods: [
+                    { name: "play", sideEffects: "write" },
+                    { name: "pause", sideEffects: "write" },
+                    { name: "seek", sideEffects: "write" },
+                  ],
+                  children: [
+                    {
+                      id: "video-out",
+                      kind: "channel",
+                      mediaType: "video/h264",
+                      direction: "sense",
+                      deliveryMode: "stream+seek",
+                      streamRef: {
+                        refId: "vid-1",
+                        mediaType: "video/h264",
+                        seek: { seekable: true, unit: "ms", durationMs: 120000 },
+                      },
+                    },
+                    {
+                      id: "audio-out",
+                      kind: "channel",
+                      mediaType: "audio/opus",
+                      direction: "sense",
+                      deliveryMode: "stream+seek",
+                      streamRef: {
+                        refId: "aud-1",
+                        mediaType: "audio/opus",
+                        seek: { seekable: true, unit: "ms", durationMs: 120000 },
+                      },
+                    },
+                    {
+                      id: "viewport",
+                      kind: "view",
+                      type: "videoSurface",
+                      state: {
+                        channelRef: "/training-win/main-split/player/video-out",
+                      },
+                    },
+                    {
+                      id: "transport",
+                      kind: "structure",
+                      type: "stack",
+                      properties: { orientation: "horizontal" },
+                      children: [
+                        {
+                          id: "play-pause",
+                          kind: "control",
+                          type: "button",
+                          properties: { label: "Play" },
+                          methods: [{ name: "invoke", sideEffects: "write" }],
+                        },
+                        {
+                          id: "scrub",
+                          kind: "editable",
+                          type: "slider",
+                          properties: {
+                            valueSchema: { type: "number", minimum: 0, maximum: 120000 },
+                          },
+                          state: { value: 0 },
+                          methods: [{ name: "setValue", sideEffects: "write" }],
+                        },
+                        {
+                          id: "subtitles-toggle",
+                          kind: "editable",
+                          type: "checkbox",
+                          properties: { label: "Captions" },
+                          state: { value: true },
+                          methods: [
+                            { name: "setValue", sideEffects: "write" },
+                            { name: "toggle", sideEffects: "write" },
+                          ],
+                        },
+                        {
+                          id: "timecode",
+                          kind: "view",
+                          type: "text",
+                          properties: { mediaType: "text/plain", temporalMode: "dynamic" },
+                          state: { value: "00:00 / 02:00" },
+                        },
+                      ],
+                    },
+                  ],
+                },
+                {
+                  id: "module-guide",
+                  kind: "document",
+                  properties: { title: "Safety & Calibration Guide", editable: false },
+                  children: [
+                    {
+                      id: "h1",
+                      kind: "structure",
+                      type: "heading",
+                      properties: { level: 1 },
+                      children: [
+                        {
+                          id: "title",
+                          kind: "view",
+                          type: "text",
+                          state: { value: "Calibration Checklist" },
+                        },
+                      ],
+                    },
+                    {
+                      id: "intro",
+                      kind: "structure",
+                      type: "paragraph",
+                      children: [
+                        {
+                          id: "lead",
+                          kind: "view",
+                          type: "span",
+                          state: { value: "Review the telemetry thresholds below, or consult the " },
+                        },
+                        {
+                          id: "ref-link",
+                          kind: "control",
+                          type: "link",
+                          properties: { label: "Reference Manual" },
+                          methods: [{ name: "invoke", sideEffects: "read" }],
+                        },
+                      ],
+                    },
+                    {
+                      id: "metrics",
+                      kind: "structure",
+                      type: "table",
+                      children: [
+                        {
+                          id: "col-param",
+                          kind: "structure",
+                          type: "column",
+                          properties: { label: "Parameter" },
+                        },
+                        {
+                          id: "col-limit",
+                          kind: "structure",
+                          type: "column",
+                          properties: { label: "Limit" },
+                        },
+                        {
+                          id: "row-1",
+                          kind: "structure",
+                          type: "row",
+                          children: [
+                            {
+                              id: "cell-1a",
+                              kind: "structure",
+                              type: "cell",
+                              children: [
+                                {
+                                  id: "v1",
+                                  kind: "view",
+                                  type: "text",
+                                  state: { value: "Max Torque" },
+                                },
+                              ],
+                            },
+                            {
+                              id: "cell-1b",
+                              kind: "structure",
+                              type: "cell",
+                              children: [
+                                {
+                                  id: "v2",
+                                  kind: "view",
+                                  type: "text",
+                                  state: { value: "18.5 Nm" },
+                                },
+                              ],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                    {
+                      id: "check-form",
+                      kind: "structure",
+                      type: "form",
+                      properties: { title: "Verification Check" },
+                      state: { valid: false, dirty: false },
+                      methods: [
+                        { name: "submit", sideEffects: "write" },
+                        { name: "reset", sideEffects: "write" },
+                        { name: "validate", sideEffects: "read" },
+                      ],
+                      children: [
+                        {
+                          id: "answer",
+                          kind: "editable",
+                          type: "radioGroup",
+                          properties: {
+                            label: "Confirm calibration step",
+                            required: true,
+                            valueSchema: { enum: ["verified", "needs-service"] },
+                          },
+                          state: { value: null },
+                          methods: [{ name: "setValue", sideEffects: "write" }],
+                        },
+                        {
+                          id: "notes",
+                          kind: "editable",
+                          type: "textField",
+                          properties: {
+                            label: "Inspector Notes",
+                            placeholder: "Optional remarks",
+                          },
+                          state: { value: "" },
+                          methods: [{ name: "setValue", sideEffects: "write" }],
+                        },
+                        {
+                          id: "submit",
+                          kind: "control",
+                          type: "button",
+                          properties: { label: "Submit Check" },
+                          methods: [{ name: "invoke", sideEffects: "write" }],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    server.registerChannel("/training-win/main-split/player/video-out", {
+      async onOpen(ctx) {
+        await ctx.sendChunk({
+          data: new Uint8Array([0x00, 0x01]),
+          offset: 0,
+        });
+      },
+    });
+
+    server.registerMethod(
+      "/training-win/main-split/player/transport/scrub",
+      "setValue",
+      async (params, ctx) => {
+        const positionMs = Number((params as { value: number }).value);
+        await ctx.updateNode(ctx.path, (prev) => ({
+          ...prev,
+          state: { ...(prev.state ?? {}), value: positionMs },
+        }));
+        await ctx.updateNode("/training-win/main-split/player", (prev) => ({
+          ...prev,
+          state: { ...(prev.state ?? {}), positionMs },
+        }));
+        return { ok: true, positionMs };
+      },
+    );
+
+    server.registerMethod("/training-win/main-split/player", "play", async (_params, ctx) => {
+      const currentPos =
+        typeof ctx.node.state?.positionMs === "number" ? ctx.node.state.positionMs : 0;
+      await ctx.updateNode(ctx.path, (prev) => ({
+        ...prev,
+        state: { ...(prev.state ?? {}), playbackState: "playing", positionMs: currentPos },
+      }));
+      await ctx.updateNode("/training-win/main-split/player/transport/timecode", (prev) => ({
+        ...prev,
+        state: { ...(prev.state ?? {}), value: "00:45 / 02:00" },
+      }));
+      await server.publishChannelChunk("/training-win/main-split/player/video-out", {
+        data: new Uint8Array([0x0a, 0x0b]),
+        offset: currentPos,
+        isFinal: true,
+      });
+      return { ok: true };
+    });
+
+    server.registerMethod(
+      "/training-win/main-split/module-guide/check-form/answer",
+      "setValue",
+      async (params, ctx) => {
+        const value = (params as { value: string }).value;
+        await ctx.updateNode(ctx.path, (prev) => ({
+          ...prev,
+          state: { ...(prev.state ?? {}), value, valid: true, dirty: true },
+        }));
+        await ctx.updateNode("/training-win/main-split/module-guide/check-form", (prev) => ({
+          ...prev,
+          state: { ...(prev.state ?? {}), valid: true, dirty: true },
+        }));
+        return { ok: true };
+      },
+    );
+
+    server.registerMethod(
+      "/training-win/main-split/module-guide/check-form/notes",
+      "setValue",
+      async (params, ctx) => {
+        const value = String((params as { value: string }).value);
+        await ctx.updateNode(ctx.path, (prev) => ({
+          ...prev,
+          state: { ...(prev.state ?? {}), value, dirty: true },
+        }));
+        await ctx.updateNode("/training-win/main-split/module-guide/check-form", (prev) => ({
+          ...prev,
+          state: { ...(prev.state ?? {}), valid: true, dirty: true },
+        }));
+        return { ok: true };
+      },
+    );
+
+    server.registerMethod(
+      "/training-win/main-split/module-guide/check-form/submit",
+      "invoke",
+      async (_params, ctx) => {
+        await ctx.updateNode("/training-win/main-split/module-guide/check-form", (prev) => ({
+          ...prev,
+          state: { ...(prev.state ?? {}), valid: true, dirty: false },
+        }));
+        return { submitted: true, status: "recorded" };
+      },
+    );
+
+    const [ct, st] = createMemoryTransportPair();
+    server.accept(st);
+    const client = await AepClient.connect(ct, { syncTree: true });
+
+    const updatedLog: Array<{ path: string; state: unknown }> = [];
+    client.onNodeUpdated((ev) => {
+      updatedLog.push({ path: ev.path, state: ev.node.state });
+    });
+
+    const viewportRes = await client.getNode("/training-win/main-split/player/viewport");
+    assert.equal(viewportRes.node.kind, "view");
+    const channelPath = viewportRes.node.state?.channelRef;
+    assert.equal(channelPath, "/training-win/main-split/player/video-out");
+
+    const videoSub = await client.openChannel({ path: channelPath! });
+    const receivedOffsets: number[] = [];
+    videoSub.onChunk((chunk) => {
+      receivedOffsets.push(chunk.offset ?? -1);
+    });
+
+    await client.invoke("/training-win/main-split/player/transport/scrub", "setValue", {
+      value: 45000,
+    });
+    await client.invoke("/training-win/main-split/player", "play");
+    await new Promise((r) => setTimeout(r, 15));
+
+    assert.deepEqual(receivedOffsets, [0, 45000]);
+    assert.ok(
+      updatedLog.some(
+        (u) =>
+          u.path === "/training-win/main-split/player" &&
+          (u.state as { playbackState?: string; positionMs?: number })?.playbackState === "playing" &&
+          (u.state as { positionMs?: number })?.positionMs === 45000,
+      ),
+    );
+    assert.ok(
+      updatedLog.some(
+        (u) =>
+          u.path === "/training-win/main-split/player/transport/timecode" &&
+          (u.state as { value?: string })?.value === "00:45 / 02:00",
+      ),
+    );
+
+    await client.invoke(
+      "/training-win/main-split/module-guide/check-form/answer",
+      "setValue",
+      { value: "verified" },
+    );
+    await client.invoke(
+      "/training-win/main-split/module-guide/check-form/notes",
+      "setValue",
+      { value: "Nominal torque" },
+    );
+    const submitRes = await client.invoke<{ submitted: boolean; status: string }>(
+      "/training-win/main-split/module-guide/check-form/submit",
+      "invoke",
+    );
+    assert.deepEqual(submitRes.result, { submitted: true, status: "recorded" });
+
+    const finalForm = await client.getNode("/training-win/main-split/module-guide/check-form");
+    assert.deepEqual(finalForm.node.state, { valid: true, dirty: false });
+
+    await videoSub.close();
     await client.close();
     await server.close();
   });

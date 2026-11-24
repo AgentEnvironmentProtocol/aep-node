@@ -41,9 +41,12 @@ import {
   type NodeInvokeResult,
   type NodeLoadChildrenResult,
   type NodeRemovedParams,
+  type NodeState,
   type NodeUpdatedParams,
+  type OUChild,
   type OUNode,
   type Path,
+  type PropertyMap,
   type TreeGetParams,
   type TreeGetResult,
   type TreeQueryMatch,
@@ -57,6 +60,8 @@ import { ClientChannelSubscription } from "./subscription.js";
 export interface CompositeMountOptions {
   sourcePath?: Path;
   type?: string;
+  properties?: PropertyMap;
+  state?: NodeState;
   meta?: MetaMap;
   methods?: MethodDecl[];
   events?: EventDecl[];
@@ -70,6 +75,8 @@ interface CompositeMountEntry {
   sourcePath: Path;
   client: AepClient;
   type?: string;
+  properties?: PropertyMap;
+  state?: NodeState;
   meta?: MetaMap;
   methods?: MethodDecl[];
   events?: EventDecl[];
@@ -150,6 +157,8 @@ export class AepCompositeClient {
       sourcePath,
       client,
       ...(options.type !== undefined ? { type: options.type } : {}),
+      ...(options.properties !== undefined ? { properties: structuredClone(options.properties) } : {}),
+      ...(options.state !== undefined ? { state: structuredClone(options.state) } : {}),
       ...(options.meta !== undefined ? { meta: structuredClone(options.meta) } : {}),
       ...(options.methods !== undefined ? { methods: structuredClone(options.methods) } : {}),
       ...(options.events !== undefined ? { events: structuredClone(options.events) } : {}),
@@ -260,18 +269,7 @@ export class AepCompositeClient {
       const children: BodyChild[] = [];
       for (const entry of this.mountsByAnchor.values()) {
         if (childDepth !== undefined && childDepth <= 0 && entry.sourcePath === "/") {
-          children.push({
-            id: entry.id,
-            kind: "ou",
-            ...(entry.type ? { type: entry.type } : {}),
-            meta: {
-              ...(entry.meta ?? {}),
-              [META_KEYS.MOUNT]: { providerId: entry.mountKey, status: "connected" },
-            },
-            ...(entry.methods ? { methods: structuredClone(entry.methods) } : {}),
-            ...(entry.events ? { events: structuredClone(entry.events) } : {}),
-            hasChildren: true,
-          });
+          children.push(this.buildSyntheticAnchorOu(entry, { hasChildren: true }));
         } else {
           const res = await entry.client.getTree({
             path: entry.sourcePath,
@@ -298,18 +296,7 @@ export class AepCompositeClient {
       if (params.maxDepth !== undefined && params.maxDepth <= 0) {
         return {
           ...(includeHead ? { head: this.getHead() } : {}),
-          node: {
-            id: mount.id,
-            kind: "ou",
-            ...(mount.type ? { type: mount.type } : {}),
-            meta: {
-              ...(mount.meta ?? {}),
-              [META_KEYS.MOUNT]: { providerId: mount.mountKey, status: "connected" },
-            },
-            ...(mount.methods ? { methods: structuredClone(mount.methods) } : {}),
-            ...(mount.events ? { events: structuredClone(mount.events) } : {}),
-            hasChildren: true,
-          },
+          node: this.buildSyntheticAnchorOu(mount, { hasChildren: true }),
         };
       }
       const res = await mount.client.getTree({
@@ -381,18 +368,7 @@ export class AepCompositeClient {
     for (const mount of this.mountsByAnchor.values()) {
       if (mount.sourcePath === "/") {
         if (params.maxDepth === undefined || params.maxDepth >= 1) {
-          const anchorNode: OUNode = {
-            id: mount.id,
-            kind: "ou",
-            ...(mount.type ? { type: mount.type } : {}),
-            meta: {
-              ...(mount.meta ?? {}),
-              [META_KEYS.MOUNT]: { providerId: mount.mountKey, status: "connected" },
-            },
-            ...(mount.methods ? { methods: structuredClone(mount.methods) } : {}),
-            ...(mount.events ? { events: structuredClone(mount.events) } : {}),
-            hasChildren: true,
-          };
+          const anchorNode = this.buildSyntheticAnchorOu(mount, { hasChildren: true });
           if (matchesQueryPredicates(anchorNode, params)) {
             allMatches.push({ path: mount.anchorPath, node: anchorNode, depth: 1 });
           }
@@ -792,28 +768,42 @@ export class AepCompositeClient {
     };
   }
 
+  private buildSyntheticAnchorOu(
+    entry: CompositeMountEntry,
+    options: { hasChildren?: true; children?: OUChild[]; includeServerInfo?: boolean } = {},
+  ): OUNode {
+    const mountMeta: Record<string, AepValue> = {
+      providerId: entry.mountKey,
+      status: "connected",
+    };
+    if (options.includeServerInfo && entry.client.serverInfo) {
+      mountMeta["serverInfo"] = entry.client.serverInfo as unknown as AepValue;
+    }
+    return {
+      id: entry.id,
+      kind: "ou",
+      ...(entry.type ? { type: entry.type } : {}),
+      ...(entry.properties ? { properties: structuredClone(entry.properties) } : {}),
+      ...(entry.state ? { state: structuredClone(entry.state) } : {}),
+      meta: {
+        ...(entry.meta ?? {}),
+        [META_KEYS.MOUNT]: mountMeta,
+      },
+      ...(entry.methods ? { methods: structuredClone(entry.methods) } : {}),
+      ...(entry.events ? { events: structuredClone(entry.events) } : {}),
+      ...(options.hasChildren ? { hasChildren: true } : {}),
+      ...(options.children !== undefined ? { children: options.children } : {}),
+    };
+  }
+
   private buildAnchorNodeFromResult(entry: CompositeMountEntry, node: TreeGetResult["node"]): AepNode {
     if (node.kind === "body") {
-      return {
-        id: entry.id,
-        kind: "ou",
-        ...(entry.type ? { type: entry.type } : {}),
-        meta: {
-          ...(entry.meta ?? {}),
-          [META_KEYS.MOUNT]: {
-            providerId: entry.mountKey,
-            status: "connected",
-            ...(entry.client.serverInfo
-              ? { serverInfo: entry.client.serverInfo as unknown as AepValue }
-              : {}),
-          },
-        },
-        ...(entry.methods ? { methods: structuredClone(entry.methods) } : {}),
-        ...(entry.events ? { events: structuredClone(entry.events) } : {}),
+      return this.buildSyntheticAnchorOu(entry, {
+        includeServerInfo: true,
         children: node.children.map((child) =>
           rewriteNodeForUpstream(child, "/", entry.anchorPath, entry.mountKey),
-        ),
-      };
+        ) as OUChild[],
+      });
     }
 
     const rewritten = rewriteNodeForUpstream(

@@ -26,13 +26,20 @@ function buildTransportTestServer(): AepServer {
         {
           id: "ui",
           kind: "interface",
+          type: "window",
           children: [
             {
               id: "screen",
-              kind: "content",
-              mediaType: "application/octet-stream",
-              temporalMode: "static",
-              binaryRef: { refId: "blob-1", mediaType: "application/octet-stream" },
+              kind: "view",
+              type: "image",
+              properties: {
+                mediaType: "application/octet-stream",
+                temporalMode: "static",
+                title: "Device Frame",
+              },
+              state: {
+                binaryRef: { refId: "blob-1", mediaType: "application/octet-stream" },
+              },
             },
           ],
         },
@@ -70,6 +77,16 @@ async function verifyRoundTrip(client: AepClient, expectedLarge = false): Promis
   const tree = await client.getTree({ path: "/" });
   assert.equal(tree.node.kind, "body");
   assert.equal(tree.node.children[0]?.id, "device");
+
+  const screen = await client.getNode("/device/ui/screen");
+  assert.equal(screen.node.kind, "view");
+  assert.equal(screen.node.type, "image");
+  assert.equal(screen.node.properties?.["title"], "Device Frame");
+  assert.equal(screen.node.properties?.["temporalMode"], "static");
+  assert.deepEqual(screen.node.state?.binaryRef, {
+    refId: "blob-1",
+    mediaType: "application/octet-stream",
+  });
 
   const bin = await client.getBinary("blob-1");
   assert.deepEqual(bin.data, BINARY_SAMPLE);

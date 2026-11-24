@@ -42,7 +42,9 @@ import {
   type NodeLoadChildrenParams,
   type NodeLoadChildrenResult,
   type NodeOrBodyRoot,
+  type NodeState,
   type Path,
+  type PropertyMap,
   type TreeQueryMatch,
   type TreeQueryParams,
   type TreeQueryResult,
@@ -59,8 +61,10 @@ export interface ServerMountOptions {
   client: AepClient;
   sourcePath?: Path;
   anchorNode?: {
-    kind: "ou" | "interface";
+    kind: Exclude<NodeKind, "channel">;
     type?: string;
+    properties?: PropertyMap;
+    state?: NodeState;
     meta?: MetaMap;
     methods?: MethodDecl[];
     events?: EventDecl[];
@@ -289,7 +293,9 @@ export class ServerMountManager {
 
     const existingAnchor = this.treeStore.findNodeInternal(options.anchorPath);
     let anchorKind: NodeKind;
+    let anchorType: string | undefined;
     let anchorParentKind: NodeKind | "body";
+    let anchorParentType: string | undefined;
     const { parentPath, id: anchorId } = splitParentPath(options.anchorPath);
 
     if (parentPath === "/") {
@@ -303,12 +309,37 @@ export class ServerMountManager {
         );
       }
       anchorParentKind = parentNode.kind;
+      anchorParentType = parentNode.type;
     }
 
     if (existingAnchor) {
       anchorKind = existingAnchor.kind;
+      anchorType = existingAnchor.type;
     } else {
       anchorKind = options.anchorNode?.kind ?? "ou";
+      anchorType = options.anchorNode?.type;
+    }
+
+    if (
+      options.lazy &&
+      (anchorKind === "channel" || (options.anchorNode?.kind as string | undefined) === "channel")
+    ) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `Channel mount anchor "${options.anchorPath}" cannot be lazy`,
+      );
+    }
+
+    if (
+      sourcePath === "/" &&
+      anchorKind !== "ou" &&
+      anchorKind !== "interface" &&
+      anchorKind !== "component"
+    ) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `Unsupported anchor node kind "${String(anchorKind)}" at "${options.anchorPath}"`,
+      );
     }
 
     let initialSubtree: NodeOrBodyRoot | undefined;
@@ -319,14 +350,14 @@ export class ServerMountManager {
       initialSubtree = treeRes.node;
 
       if (sourcePath === "/") {
-        validateMountContainment(anchorKind, initialSubtree);
+        validateMountContainment(anchorKind, initialSubtree, anchorType);
         if (initialSubtree.kind === "body") {
           for (const child of initialSubtree.children) {
             validateNodeCapabilities(child, capabilities, `${options.anchorPath}/${child.id}`);
           }
         }
       } else {
-        validateMountContainment(anchorParentKind, initialSubtree);
+        validateMountContainment(anchorParentKind, initialSubtree, anchorParentType);
         if (initialSubtree.kind !== "body") {
           validateNodeCapabilities(initialSubtree, capabilities, options.anchorPath);
         }
@@ -346,30 +377,127 @@ export class ServerMountManager {
 
     let createdAnchor = false;
     if (!existingAnchor) {
-      const baseKind =
-        sourcePath !== "/" && initialSubtree && initialSubtree.kind !== "body"
-          ? (initialSubtree.kind as "ou" | "interface")
-          : (options.anchorNode?.kind ?? "ou");
-      if (baseKind !== "ou" && baseKind !== "interface") {
-        throw new AepError(
-          AEP_ERROR_CODES.INVALID_MESSAGE,
-          `Unsupported anchor node kind "${String(baseKind)}" at "${options.anchorPath}"`,
-        );
-      }
-      const newAnchor: AepNode = {
-        id: anchorId,
-        kind: baseKind,
-        ...(options.anchorNode?.type ? { type: options.anchorNode.type } : {}),
-        meta: {
-          ...(options.anchorNode?.meta ?? {}),
+      if (sourcePath === "/") {
+        const baseKind = options.anchorNode?.kind ?? "ou";
+        if (baseKind !== "ou" && baseKind !== "interface" && baseKind !== "component") {
+          throw new AepError(
+            AEP_ERROR_CODES.INVALID_MESSAGE,
+            `Unsupported anchor node kind "${String(baseKind)}" at "${options.anchorPath}"`,
+          );
+        }
+        const newAnchor = {
+          id: anchorId,
+          kind: baseKind,
+          ...(options.anchorNode?.type !== undefined ? { type: options.anchorNode.type } : {}),
+          ...(options.anchorNode?.properties !== undefined
+            ? { properties: structuredClone(options.anchorNode.properties) }
+            : {}),
+          ...(options.anchorNode?.state !== undefined
+            ? { state: structuredClone(options.anchorNode.state) }
+            : {}),
+          meta: {
+            ...(options.anchorNode?.meta ?? {}),
+            [META_KEYS.MOUNT]: mountMetaValue,
+          },
+          ...(options.anchorNode?.methods !== undefined
+            ? { methods: structuredClone(options.anchorNode.methods) }
+            : {}),
+          ...(options.anchorNode?.events !== undefined
+            ? { events: structuredClone(options.anchorNode.events) }
+            : {}),
+          ...(options.lazy ? { hasChildren: true } : {}),
+        } as AepNode;
+        this.treeStore.addNode(parentPath, newAnchor, undefined, capabilities);
+        createdAnchor = true;
+      } else if (!options.lazy && initialSubtree && initialSubtree.kind !== "body") {
+        const mergedType = options.anchorNode?.type ?? initialSubtree.type;
+        const mergedProperties =
+          initialSubtree.properties || options.anchorNode?.properties
+            ? {
+                ...(initialSubtree.properties ? structuredClone(initialSubtree.properties) : {}),
+                ...(options.anchorNode?.properties
+                  ? structuredClone(options.anchorNode.properties)
+                  : {}),
+              }
+            : undefined;
+        const mergedState =
+          initialSubtree.state || options.anchorNode?.state
+            ? {
+                ...(initialSubtree.state ? structuredClone(initialSubtree.state) : {}),
+                ...(options.anchorNode?.state ? structuredClone(options.anchorNode.state) : {}),
+              }
+            : undefined;
+        const mergedMethods = options.anchorNode?.methods ?? initialSubtree.methods;
+        const mergedEvents = options.anchorNode?.events ?? initialSubtree.events;
+        const mergedMeta: MetaMap = {
+          ...(initialSubtree.meta ? structuredClone(initialSubtree.meta) : {}),
+          ...(options.anchorNode?.meta ? structuredClone(options.anchorNode.meta) : {}),
           [META_KEYS.MOUNT]: mountMetaValue,
-        },
-        ...(options.anchorNode?.methods ? { methods: options.anchorNode.methods } : {}),
-        ...(options.anchorNode?.events ? { events: options.anchorNode.events } : {}),
-        ...(options.lazy ? { hasChildren: true } : {}),
-      };
-      this.treeStore.addNode(parentPath, newAnchor, undefined, capabilities);
-      createdAnchor = true;
+        };
+
+        const newAnchor: AepNode =
+          initialSubtree.kind === "channel"
+            ? {
+                id: anchorId,
+                kind: "channel",
+                ...(mergedType !== undefined ? { type: mergedType } : {}),
+                ...(mergedProperties !== undefined ? { properties: mergedProperties } : {}),
+                ...(mergedState !== undefined ? { state: mergedState } : {}),
+                ...(mergedMethods !== undefined ? { methods: structuredClone(mergedMethods) } : {}),
+                ...(mergedEvents !== undefined ? { events: structuredClone(mergedEvents) } : {}),
+                meta: mergedMeta,
+                mediaType: initialSubtree.mediaType,
+                direction: initialSubtree.direction,
+                deliveryMode: initialSubtree.deliveryMode,
+                ...(initialSubtree.streamRef !== undefined
+                  ? { streamRef: structuredClone(initialSubtree.streamRef) }
+                  : {}),
+              }
+            : ({
+                id: anchorId,
+                kind: initialSubtree.kind,
+                ...(mergedType !== undefined ? { type: mergedType } : {}),
+                ...(mergedProperties !== undefined ? { properties: mergedProperties } : {}),
+                ...(mergedState !== undefined ? { state: mergedState } : {}),
+                ...(mergedMethods !== undefined ? { methods: structuredClone(mergedMethods) } : {}),
+                ...(mergedEvents !== undefined ? { events: structuredClone(mergedEvents) } : {}),
+                meta: mergedMeta,
+              } as AepNode);
+        this.treeStore.addNode(parentPath, newAnchor, undefined, capabilities);
+        createdAnchor = true;
+      } else {
+        const baseKind = options.anchorNode?.kind ?? "ou";
+        if ((baseKind as string) === "channel") {
+          throw new AepError(
+            AEP_ERROR_CODES.INVALID_MESSAGE,
+            `Channel anchor "${options.anchorPath}" cannot be mounted lazily`,
+          );
+        }
+        const newAnchor = {
+          id: anchorId,
+          kind: baseKind,
+          ...(options.anchorNode?.type !== undefined ? { type: options.anchorNode.type } : {}),
+          ...(options.anchorNode?.properties !== undefined
+            ? { properties: structuredClone(options.anchorNode.properties) }
+            : {}),
+          ...(options.anchorNode?.state !== undefined
+            ? { state: structuredClone(options.anchorNode.state) }
+            : {}),
+          meta: {
+            ...(options.anchorNode?.meta ?? {}),
+            [META_KEYS.MOUNT]: mountMetaValue,
+          },
+          ...(options.anchorNode?.methods !== undefined
+            ? { methods: structuredClone(options.anchorNode.methods) }
+            : {}),
+          ...(options.anchorNode?.events !== undefined
+            ? { events: structuredClone(options.anchorNode.events) }
+            : {}),
+          ...(options.lazy ? { hasChildren: true } : {}),
+        } as AepNode;
+        this.treeStore.addNode(parentPath, newAnchor, undefined, capabilities);
+        createdAnchor = true;
+      }
     } else {
       this.treeStore.updateNode(
         options.anchorPath,
@@ -379,7 +507,7 @@ export class ServerMountManager {
             ...(prev.meta ?? {}),
             [META_KEYS.MOUNT]: mountMetaValue,
           },
-          ...(options.lazy ? { hasChildren: true } : {}),
+          ...(options.lazy && prev.kind !== "channel" ? { hasChildren: true } : {}),
         }),
         capabilities,
       );
@@ -606,7 +734,7 @@ export class ServerMountManager {
     if (upstreamPath === mount.anchorPath && mount.sourcePath === "/") {
       const localAnchor = this.treeStore.getNode(mount.anchorPath, 0);
       if (maxDepth !== undefined && maxDepth <= 0) {
-        return { ...localAnchor, hasChildren: true };
+        return localAnchor.kind === "channel" ? localAnchor : { ...localAnchor, hasChildren: true };
       }
       const childDepth = maxDepth !== undefined ? maxDepth - 1 : undefined;
       const res = await withMountTimeout(mount, () =>
@@ -677,10 +805,10 @@ export class ServerMountManager {
       const mount = this.mountsByAnchor.get(nodePath);
       if (mount) {
         if (remainingDepth !== undefined && remainingDepth <= 0) {
-          return { ...node, hasChildren: true };
+          return node.kind === "channel" ? node : { ...node, hasChildren: true };
         }
         if (mount.lazy && !mount.hydrated) {
-          return { ...node, hasChildren: true };
+          return node.kind === "channel" ? node : { ...node, hasChildren: true };
         }
         try {
           return await this.getNodeOrTreeFromMount(mount, nodePath, remainingDepth);

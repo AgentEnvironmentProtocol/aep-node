@@ -126,6 +126,7 @@ export class TreeStore {
     const cloned = cloneNode(node);
 
     let parentKind: NodeKind | "body";
+    let parentType: string | undefined;
     let targetList: AepNode[];
     const ancestors = new Set<object>();
 
@@ -141,6 +142,7 @@ export class TreeStore {
         );
       }
       parentKind = parent.kind;
+      parentType = parent.type;
       ancestors.add(parent);
       if (parent.kind === "channel") {
         throw new AepError(
@@ -154,7 +156,7 @@ export class TreeStore {
       targetList = parent.children;
     }
 
-    validateNode(cloned, parentKind, ancestors, parentPath);
+    validateNode(cloned, parentKind, ancestors, parentPath, parentType);
     if (targetList.some((sibling) => sibling.id === cloned.id)) {
       throw new AepError(
         AEP_ERROR_CODES.INVALID_MESSAGE,
@@ -189,6 +191,7 @@ export class TreeStore {
     const { parentPath, id } = splitParentPath(path);
 
     let parentKind: NodeKind | "body";
+    let parentType: string | undefined;
     let targetList: AepNode[];
     const ancestors = new Set<object>();
 
@@ -201,6 +204,7 @@ export class TreeStore {
         throw new AepError(AEP_ERROR_CODES.NODE_NOT_FOUND, `Node not found at path "${path}"`);
       }
       parentKind = parent.kind;
+      parentType = parent.type;
       ancestors.add(parent);
       targetList = parent.children;
     }
@@ -220,7 +224,7 @@ export class TreeStore {
       );
     }
 
-    validateNode(next, parentKind, ancestors, parentPath);
+    validateNode(next, parentKind, ancestors, parentPath, parentType);
     if (capabilities) {
       validateNodeCapabilities(next, capabilities, path);
     }

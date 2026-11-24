@@ -55,10 +55,15 @@ function buildSharedBody(): BodyChild[] {
           children: [
             {
               id: "label",
-              kind: "content",
-              mediaType: "text/plain",
-              temporalMode: "dynamic",
-              value: "initial",
+              kind: "view",
+              type: "text",
+              properties: {
+                mediaType: "text/plain",
+                temporalMode: "dynamic",
+              },
+              state: {
+                value: "initial",
+              },
             },
           ],
         },
@@ -183,7 +188,10 @@ describe("Sessions, Roles, and Concurrency Policies", () => {
     isolatedServer.registerMethod("/robot", "setLabel", async (params, ctx) => {
       await ctx.updateNode("/robot/hud/label", (prev) => ({
         ...prev,
-        ...(prev.kind === "content" ? { value: String(params) } : {}),
+        state: {
+          ...(prev.state ?? {}),
+          value: String(params),
+        },
       }));
       return { ok: true };
     });
@@ -196,8 +204,8 @@ describe("Sessions, Roles, and Concurrency Policies", () => {
     await s1.invoke("/robot", "setLabel", "session-1-only");
     const s1Label = await s1.getNode("/robot/hud/label");
     const s2Label = await s2.getNode("/robot/hud/label");
-    assert.equal(s1Label.node.kind === "content" ? s1Label.node.value : undefined, "session-1-only");
-    assert.equal(s2Label.node.kind === "content" ? s2Label.node.value : undefined, "initial");
+    assert.equal(s1Label.node.kind === "view" ? s1Label.node.state?.value : undefined, "session-1-only");
+    assert.equal(s2Label.node.kind === "view" ? s2Label.node.state?.value : undefined, "initial");
 
     await s1.close();
     await s2.close();

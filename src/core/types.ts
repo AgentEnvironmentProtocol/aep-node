@@ -16,26 +16,148 @@ export const HEAD_KEYS = {
 } as const;
 
 export const META_KEYS = {
-  DESCRIPTION: "aep.description",
-  ALT_TEXT: "aep.altText",
-  LABELS: "aep.labels",
-  BOUNDS: "aep.bounds",
-  CAPTURE: "aep.capture",
-  READONLY: "aep.readonly",
-  DISABLED: "aep.disabled",
   MOUNT: "aep.mount",
+} as const;
+
+export const PROPERTY_KEYS = {
+  TITLE: "title",
+  LABEL: "label",
+  DESCRIPTION: "description",
+  ALT_TEXT: "altText",
+  BOUNDS: "bounds",
+  CAPTURE: "capture",
+  DISABLED: "disabled",
+  READONLY: "readonly",
+  REQUIRED: "required",
+  PLACEHOLDER: "placeholder",
+  MEDIA_TYPE: "mediaType",
+  TEMPORAL_MODE: "temporalMode",
+  VALUE_SCHEMA: "valueSchema",
+  EDITABLE: "editable",
+  MODAL: "modal",
+  ORIENTATION: "orientation",
+  ROWS: "rows",
+  COLUMNS: "columns",
+  LABELS: "labels",
+  LEVEL: "level",
+} as const;
+
+export const STATE_KEYS = {
+  VALUE: "value",
+  BINARY_REF: "binaryRef",
+  CHANNEL_REF: "channelRef",
+  FOCUSED: "focused",
+  PRESSED: "pressed",
+  VALID: "valid",
+  VALIDATION_MESSAGE: "validationMessage",
+  DIRTY: "dirty",
+  EXPANDED: "expanded",
+  SELECTED: "selected",
+  WINDOW_STATE: "windowState",
+  OPEN: "open",
+  PLAYBACK_STATE: "playbackState",
+  POSITION_MS: "positionMs",
+  SELECTION: "selection",
+} as const;
+
+export const CORE_INTERFACE_TYPES = ["display", "window", "dialog", "page"] as const;
+export type CoreInterfaceType = (typeof CORE_INTERFACE_TYPES)[number];
+
+export const CORE_STRUCTURE_TYPES = [
+  "form",
+  "section",
+  "stack",
+  "grid",
+  "table",
+  "column",
+  "row",
+  "cell",
+  "paragraph",
+  "heading",
+  "list",
+  "listItem",
+  "blockquote",
+  "codeBlock",
+] as const;
+export type CoreStructureType = (typeof CORE_STRUCTURE_TYPES)[number];
+
+export const CORE_VIEW_TYPES = [
+  "text",
+  "span",
+  "label",
+  "badge",
+  "code",
+  "image",
+  "icon",
+  "videoSurface",
+  "audioOutput",
+  "canvas",
+  "progress",
+] as const;
+export type CoreViewType = (typeof CORE_VIEW_TYPES)[number];
+
+export const CORE_EDITABLE_TYPES = [
+  "textField",
+  "textArea",
+  "numberField",
+  "passwordField",
+  "searchField",
+  "checkbox",
+  "switch",
+  "toggleButton",
+  "radioGroup",
+  "radio",
+  "select",
+  "comboBox",
+  "slider",
+  "rangeSlider",
+  "dateField",
+  "colorField",
+  "voiceInput",
+] as const;
+export type CoreEditableType = (typeof CORE_EDITABLE_TYPES)[number];
+
+export const CORE_CONTROL_TYPES = [
+  "button",
+  "iconButton",
+  "menuItem",
+  "link",
+  "command",
+  "toolbarButton",
+] as const;
+export type CoreControlType = (typeof CORE_CONTROL_TYPES)[number];
+
+export const CORE_BUILTIN_TYPES = {
+  interface: CORE_INTERFACE_TYPES,
+  structure: CORE_STRUCTURE_TYPES,
+  view: CORE_VIEW_TYPES,
+  editable: CORE_EDITABLE_TYPES,
+  control: CORE_CONTROL_TYPES,
 } as const;
 
 export type AepPrimitive = null | boolean | number | string;
 export type AepValue = AepPrimitive | AepValue[] | { [key: string]: AepValue };
 export type MetaMap = Record<string, AepValue>;
+export type PropertyMap = Record<string, AepValue>;
 export type SchemaObject = Record<string, AepValue>;
 export type Path = string;
 
-export type NodeKind = "ou" | "interface" | "channel" | "structure" | "content" | "input";
+export type NodeKind =
+  | "ou"
+  | "interface"
+  | "channel"
+  | "structure"
+  | "component"
+  | "document"
+  | "view"
+  | "editable"
+  | "control";
 export type Direction = "sense" | "act" | "duplex";
 export type DeliveryMode = "stream" | "stream+seek";
 export type TemporalState = "static" | "dynamic";
+export type Orientation = "horizontal" | "vertical";
+export type WindowState = "normal" | "minimized" | "maximized" | "fullscreen";
+export type PlaybackState = "idle" | "playing" | "paused" | "buffering" | "ended" | "error";
 export type InvocationMode = "request-response" | "notification";
 export type SideEffect = "none" | "read" | "write";
 export type SeekUnit = "ms" | "seconds" | "frames" | "bytes" | "samples";
@@ -92,13 +214,50 @@ export interface EventDecl {
   meta?: MetaMap;
 }
 
+export interface CaptureDescriptor {
+  binary: boolean;
+  mediaType?: string;
+  refId?: string;
+  regionSupported?: boolean;
+  [key: string]: AepValue | undefined;
+}
+
+export interface SelectionState {
+  start: number;
+  end: number;
+  anchorPath?: Path;
+  focusPath?: Path;
+  [key: string]: AepValue | undefined;
+}
+
+export interface NodeState {
+  value?: AepValue;
+  binaryRef?: BinaryRef;
+  channelRef?: Path;
+  focused?: boolean;
+  pressed?: boolean;
+  valid?: boolean;
+  validationMessage?: string;
+  dirty?: boolean;
+  expanded?: boolean;
+  selected?: boolean;
+  windowState?: WindowState;
+  open?: boolean;
+  playbackState?: PlaybackState;
+  positionMs?: number;
+  selection?: SelectionState;
+  [key: string]: AepValue | BinaryRef | SelectionState | undefined;
+}
+
 export interface NodeHeader {
   id: string;
   kind: NodeKind;
   type?: string;
-  meta?: MetaMap;
+  properties?: PropertyMap;
+  state?: NodeState;
   methods?: MethodDecl[];
   events?: EventDecl[];
+  meta?: MetaMap;
   hasChildren?: boolean;
 }
 
@@ -123,26 +282,42 @@ export interface StructureElementNode extends NodeHeader {
   children?: StructureChild[];
 }
 
-export interface ContentElementNode extends NodeHeader {
-  kind: "content";
-  mediaType: string;
-  temporalMode: TemporalState;
-  value?: AepValue;
-  binaryRef?: BinaryRef;
-  channelRef?: Path;
+export type ComponentChild = ElementNode | InterfaceNode | ChannelNode;
+
+export interface ComponentElementNode extends NodeHeader {
+  kind: "component";
+  children?: ComponentChild[];
+}
+
+export type DocumentChild = ElementNode | InterfaceNode;
+
+export interface DocumentElementNode extends NodeHeader {
+  kind: "document";
+  children?: DocumentChild[];
+}
+
+export interface ViewElementNode extends NodeHeader {
+  kind: "view";
   children?: ElementNode[];
 }
 
-export interface InputElementNode extends NodeHeader {
-  kind: "input";
-  mediaType: string;
-  inputSchema?: SchemaObject;
-  value?: AepValue;
-  channelRef?: Path;
+export interface EditableElementNode extends NodeHeader {
+  kind: "editable";
   children?: ElementNode[];
 }
 
-export type ElementNode = StructureElementNode | ContentElementNode | InputElementNode;
+export interface ControlElementNode extends NodeHeader {
+  kind: "control";
+  children?: ElementNode[];
+}
+
+export type ElementNode =
+  | StructureElementNode
+  | ComponentElementNode
+  | DocumentElementNode
+  | ViewElementNode
+  | EditableElementNode
+  | ControlElementNode;
 
 export interface ChannelNode extends NodeHeader {
   kind: "channel";
@@ -150,7 +325,6 @@ export interface ChannelNode extends NodeHeader {
   direction: Direction;
   deliveryMode: DeliveryMode;
   streamRef?: StreamRef;
-  streamMeta?: MetaMap;
 }
 
 export type BodyChild = OUNode | InterfaceNode | ChannelNode;
@@ -160,8 +334,11 @@ export type AepNode =
   | InterfaceNode
   | ChannelNode
   | StructureElementNode
-  | ContentElementNode
-  | InputElementNode;
+  | ComponentElementNode
+  | DocumentElementNode
+  | ViewElementNode
+  | EditableElementNode
+  | ControlElementNode;
 
 export interface BodyRoot {
   path: "/";
@@ -304,16 +481,20 @@ export interface TreeGetResult {
   node: NodeOrBodyRoot;
 }
 
-export interface TreeQueryMetaFilter {
+export interface TreeQueryKeyValueFilter {
   key: string;
   value?: AepValue;
 }
+
+export type TreeQueryMetaFilter = TreeQueryKeyValueFilter;
 
 export interface TreeQueryParams {
   rootPath?: Path;
   kinds?: NodeKind[];
   types?: string[];
-  meta?: TreeQueryMetaFilter[];
+  properties?: TreeQueryKeyValueFilter[];
+  state?: TreeQueryKeyValueFilter[];
+  meta?: TreeQueryKeyValueFilter[];
   hasMethod?: string;
   direction?: Direction;
   mediaTypePrefix?: string;

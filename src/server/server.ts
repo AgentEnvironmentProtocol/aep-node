@@ -836,7 +836,7 @@ export class AepServer {
 
       const validatedChildren = rawChildren.map((child) => {
         const cloned = cloneNode(child);
-        validateNode(cloned, node.kind, new Set([node]), params.path);
+        validateNode(cloned, node.kind, new Set([node]), params.path, node.type);
         validateNodeCapabilities(
           cloned,
           session.capabilities,

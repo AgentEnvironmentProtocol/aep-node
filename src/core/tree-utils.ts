@@ -6,6 +6,7 @@ import type {
   BodyChild,
   BodyRoot,
   Path,
+  TreeQueryKeyValueFilter,
   TreeQueryMatch,
   TreeQueryParams,
   TreeQueryResult,
@@ -59,14 +60,20 @@ export function cloneNode<T extends AepNode>(node: T, maxDepth?: number): T {
   if (node.type !== undefined) {
     copy["type"] = node.type;
   }
-  if (node.meta !== undefined) {
-    copy["meta"] = structuredClone(node.meta);
+  if (node.properties !== undefined) {
+    copy["properties"] = structuredClone(node.properties);
+  }
+  if (node.state !== undefined) {
+    copy["state"] = structuredClone(node.state);
   }
   if (node.methods !== undefined) {
     copy["methods"] = structuredClone(node.methods);
   }
   if (node.events !== undefined) {
     copy["events"] = structuredClone(node.events);
+  }
+  if (node.meta !== undefined) {
+    copy["meta"] = structuredClone(node.meta);
   }
 
   if (node.kind === "channel") {
@@ -76,35 +83,7 @@ export function cloneNode<T extends AepNode>(node: T, maxDepth?: number): T {
     if (node.streamRef !== undefined) {
       copy["streamRef"] = structuredClone(node.streamRef);
     }
-    if (node.streamMeta !== undefined) {
-      copy["streamMeta"] = structuredClone(node.streamMeta);
-    }
     return copy as T;
-  }
-
-  if (node.kind === "content") {
-    copy["mediaType"] = node.mediaType;
-    copy["temporalMode"] = node.temporalMode;
-    if (node.value !== undefined) {
-      copy["value"] = structuredClone(node.value);
-    }
-    if (node.binaryRef !== undefined) {
-      copy["binaryRef"] = structuredClone(node.binaryRef);
-    }
-    if (node.channelRef !== undefined) {
-      copy["channelRef"] = node.channelRef;
-    }
-  } else if (node.kind === "input") {
-    copy["mediaType"] = node.mediaType;
-    if (node.inputSchema !== undefined) {
-      copy["inputSchema"] = structuredClone(node.inputSchema);
-    }
-    if (node.value !== undefined) {
-      copy["value"] = structuredClone(node.value);
-    }
-    if (node.channelRef !== undefined) {
-      copy["channelRef"] = node.channelRef;
-    }
   }
 
   const hasExistingChildren = Array.isArray(node.children) && node.children.length > 0;
@@ -200,23 +179,46 @@ function collectStrings(value: AepValue | undefined, out: string[]): void {
   }
 }
 
+const TEXT_CONTAINS_PROPERTY_KEYS = ["title", "label", "description", "altText"] as const;
+
 function matchesTextContains(node: AepNode, needleLower: string): boolean {
   const strings: string[] = [];
+  if (node.properties) {
+    for (const key of TEXT_CONTAINS_PROPERTY_KEYS) {
+      const val = node.properties[key];
+      if (typeof val === "string") {
+        strings.push(val);
+      }
+    }
+  }
+  if (node.state?.value !== undefined) {
+    collectStrings(node.state.value, strings);
+  }
   if (node.meta) {
-    const desc = node.meta["aep.description"];
-    const alt = node.meta["aep.altText"];
-    if (typeof desc === "string") {
-      strings.push(desc);
-    }
-    if (typeof alt === "string") {
-      strings.push(alt);
-    }
     collectStrings(node.meta, strings);
   }
-  if ((node.kind === "content" || node.kind === "input") && node.value !== undefined) {
-    collectStrings(node.value, strings);
-  }
   return strings.some((s) => s.toLowerCase().includes(needleLower));
+}
+
+function matchesKeyValueFilters(
+  map: Record<string, unknown> | undefined,
+  filters: readonly TreeQueryKeyValueFilter[],
+): boolean {
+  if (filters.length === 0) {
+    return true;
+  }
+  if (!map) {
+    return false;
+  }
+  for (const filter of filters) {
+    if (!Object.prototype.hasOwnProperty.call(map, filter.key) || map[filter.key] === undefined) {
+      return false;
+    }
+    if (filter.value !== undefined && !deepEqualValue(map[filter.key], filter.value)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function matchesQueryPredicates(node: AepNode, params: TreeQueryParams): boolean {
@@ -226,19 +228,14 @@ export function matchesQueryPredicates(node: AepNode, params: TreeQueryParams): 
   if (params.types && !matchesTypeTag(node.type, params.types)) {
     return false;
   }
-  if (params.meta) {
-    const meta = node.meta;
-    if (!meta) {
-      return false;
-    }
-    for (const filter of params.meta) {
-      if (!Object.prototype.hasOwnProperty.call(meta, filter.key)) {
-        return false;
-      }
-      if (filter.value !== undefined && !deepEqualValue(meta[filter.key], filter.value)) {
-        return false;
-      }
-    }
+  if (params.properties && !matchesKeyValueFilters(node.properties, params.properties)) {
+    return false;
+  }
+  if (params.state && !matchesKeyValueFilters(node.state, params.state)) {
+    return false;
+  }
+  if (params.meta && !matchesKeyValueFilters(node.meta, params.meta)) {
+    return false;
   }
   if (params.hasMethod !== undefined) {
     if (!node.methods || !node.methods.some((m) => m.name === params.hasMethod)) {
@@ -251,7 +248,13 @@ export function matchesQueryPredicates(node: AepNode, params: TreeQueryParams): 
     }
   }
   if (params.mediaTypePrefix !== undefined) {
-    if (!("mediaType" in node) || !node.mediaType.startsWith(params.mediaTypePrefix)) {
+    const mediaType =
+      node.kind === "channel"
+        ? node.mediaType
+        : typeof node.properties?.["mediaType"] === "string"
+          ? node.properties["mediaType"]
+          : undefined;
+    if (!mediaType || !mediaType.startsWith(params.mediaTypePrefix)) {
       return false;
     }
   }

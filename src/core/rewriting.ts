@@ -1,5 +1,5 @@
 import { isValidPath, rebasePath } from "./path.js";
-import type { AepNode, BinaryRef, MetaMap, Path, StreamRef } from "./types.js";
+import type { AepNode, BinaryRef, NodeState, Path, PropertyMap, StreamRef } from "./types.js";
 
 export interface ParsedMountRefId {
   mountKey: string;
@@ -36,12 +36,15 @@ export function parseUpstreamRefId(refId: string): ParsedMountRefId | null {
   }
 }
 
-function rewriteCaptureMeta(meta: MetaMap | undefined, mountKey: string): MetaMap | undefined {
-  if (!meta) {
+function rewriteCaptureProperty(
+  properties: PropertyMap | undefined,
+  mountKey: string,
+): PropertyMap | undefined {
+  if (!properties) {
     return undefined;
   }
-  const cloned = structuredClone(meta);
-  const capture = cloned["aep.capture"];
+  const cloned = structuredClone(properties);
+  const capture = cloned["capture"];
   if (typeof capture === "object" && capture !== null && !Array.isArray(capture)) {
     const refId = (capture as Record<string, unknown>)["refId"];
     if (typeof refId === "string" && refId.length > 0) {
@@ -85,8 +88,25 @@ export function rewriteNodeForUpstream<T extends AepNode>(
 ): T {
   const cloned = structuredClone(node);
 
-  if (cloned.meta) {
-    cloned.meta = rewriteCaptureMeta(cloned.meta, mountKey);
+  if (cloned.properties) {
+    cloned.properties = rewriteCaptureProperty(cloned.properties, mountKey);
+  }
+
+  if (cloned.state) {
+    const nextState: NodeState = structuredClone(cloned.state);
+    if (nextState.binaryRef) {
+      nextState.binaryRef = {
+        ...nextState.binaryRef,
+        refId: toUpstreamRefId(mountKey, nextState.binaryRef.refId),
+      };
+    }
+    if (typeof nextState.channelRef === "string" && isValidPath(nextState.channelRef)) {
+      const rebased = rebasePath(nextState.channelRef, sourceRoot, anchorPath);
+      if (rebased) {
+        nextState.channelRef = rebased;
+      }
+    }
+    cloned.state = nextState;
   }
 
   if (cloned.kind === "channel") {
@@ -97,28 +117,6 @@ export function rewriteNodeForUpstream<T extends AepNode>(
       };
     }
     return cloned;
-  }
-
-  if (cloned.kind === "content") {
-    if (cloned.binaryRef) {
-      cloned.binaryRef = {
-        ...cloned.binaryRef,
-        refId: toUpstreamRefId(mountKey, cloned.binaryRef.refId),
-      };
-    }
-    if (cloned.channelRef && isValidPath(cloned.channelRef)) {
-      const rebased = rebasePath(cloned.channelRef, sourceRoot, anchorPath);
-      if (rebased) {
-        cloned.channelRef = rebased;
-      }
-    }
-  } else if (cloned.kind === "input") {
-    if (cloned.channelRef && isValidPath(cloned.channelRef)) {
-      const rebased = rebasePath(cloned.channelRef, sourceRoot, anchorPath);
-      if (rebased) {
-        cloned.channelRef = rebased;
-      }
-    }
   }
 
   if (cloned.children) {

@@ -19,9 +19,13 @@ import {
   validateNode,
   type BodyChild,
   type ChannelNode,
-  type ContentElementNode,
+  type ComponentElementNode,
+  type ControlElementNode,
+  type DocumentElementNode,
   type InterfaceNode,
   type OUNode,
+  type StructureElementNode,
+  type ViewElementNode,
 } from "aep-node";
 
 describe("Path and Lexical Validation", () => {
@@ -77,7 +81,7 @@ describe("Path and Lexical Validation", () => {
 });
 
 describe("Formal Grammar Invariants", () => {
-  it("accepts valid nested OU, Interface, Structure, Content, Input, and Channel nodes", () => {
+  it("accepts valid nested nodes across all 9 NodeKinds including Component-owned Channels, Documents, and Tables", () => {
     const body: BodyChild[] = [
       {
         id: "workstation",
@@ -96,12 +100,18 @@ describe("Formal Grammar Invariants", () => {
           {
             id: "ide",
             kind: "interface",
-            type: "desktop.window",
+            type: "window",
+            properties: {
+              title: "IDE",
+              bounds: { x: 0, y: 0, width: 1280, height: 800, coordSpace: "pixel" },
+            },
+            state: { windowState: "normal", focused: true },
             children: [
               {
                 id: "layout",
                 kind: "structure",
-                type: "desktop.panel",
+                type: "grid",
+                properties: { columns: 2 },
                 children: [
                   {
                     id: "term",
@@ -110,18 +120,100 @@ describe("Formal Grammar Invariants", () => {
                     children: [
                       {
                         id: "scrollback",
-                        kind: "content",
-                        mediaType: "text/plain",
-                        temporalMode: "dynamic",
-                        value: "ready",
+                        kind: "view",
+                        type: "desktop.textLog",
+                        properties: { mediaType: "text/plain", temporalMode: "dynamic" },
+                        state: { value: "ready" },
                       },
                     ],
                   },
                   {
-                    id: "mic-in",
-                    kind: "input",
-                    mediaType: "audio/opus",
-                    channelRef: "/workstation/sys-audio",
+                    id: "player",
+                    kind: "component",
+                    type: "media.videoPlayer",
+                    state: { playbackState: "paused", positionMs: 0 },
+                    children: [
+                      {
+                        id: "video-out",
+                        kind: "channel",
+                        mediaType: "video/h264",
+                        direction: "sense",
+                        deliveryMode: "stream+seek",
+                      },
+                      {
+                        id: "viewport",
+                        kind: "view",
+                        type: "videoSurface",
+                        state: { channelRef: "/workstation/ide/layout/player/video-out" },
+                      },
+                      {
+                        id: "play-btn",
+                        kind: "control",
+                        type: "button",
+                        properties: { label: "Play" },
+                        state: { pressed: false, focused: false },
+                        methods: [{ name: "invoke", sideEffects: "write" }],
+                      },
+                      {
+                        id: "embedded-hud",
+                        kind: "interface",
+                        type: "dialog",
+                        properties: { modal: false },
+                      },
+                    ],
+                  },
+                  {
+                    id: "guide",
+                    kind: "document",
+                    properties: { title: "Guide", editable: false },
+                    children: [
+                      {
+                        id: "metrics",
+                        kind: "structure",
+                        type: "table",
+                        children: [
+                          {
+                            id: "col-1",
+                            kind: "structure",
+                            type: "column",
+                            properties: { label: "Metric" },
+                          },
+                          {
+                            id: "row-1",
+                            kind: "structure",
+                            type: "row",
+                            state: { selected: false },
+                            children: [
+                              {
+                                id: "cell-1",
+                                kind: "structure",
+                                type: "cell",
+                                children: [
+                                  {
+                                    id: "cell-text",
+                                    kind: "view",
+                                    type: "text",
+                                    state: { value: "Nominal" },
+                                  },
+                                ],
+                              },
+                            ],
+                          },
+                        ],
+                      },
+                      {
+                        id: "mic-in",
+                        kind: "editable",
+                        type: "voiceInput",
+                        properties: { mediaType: "audio/opus" },
+                        state: { channelRef: "/workstation/sys-audio" },
+                      },
+                      {
+                        id: "doc-slot",
+                        kind: "interface",
+                        type: "page",
+                      },
+                    ],
                   },
                 ],
               },
@@ -134,7 +226,7 @@ describe("Formal Grammar Invariants", () => {
     assert.doesNotThrow(() => validateBody(body, { strictChannelRefs: true }));
   });
 
-  it("rejects containment violations and disjoint NodeKind errors", () => {
+  it("rejects containment violations and enforces Component/Document/Interface placement rules", () => {
     const ouInsideInterface: InterfaceNode = {
       id: "win",
       kind: "interface",
@@ -145,49 +237,106 @@ describe("Formal Grammar Invariants", () => {
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
     );
 
-    const elementInsideOu: OUNode = {
+    const viewInsideOu: OUNode = {
       id: "host",
       kind: "ou",
       children: [
         {
           id: "lbl",
-          kind: "content",
-          mediaType: "text/plain",
-          temporalMode: "static",
+          kind: "view",
+          properties: { mediaType: "text/plain", temporalMode: "static" },
         } as unknown as OUNode,
       ],
     };
     assert.throws(
-      () => validateNode(elementInsideOu, "body"),
+      () => validateNode(viewInsideOu, "body"),
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
     );
 
-    const channelInsideStructure: InterfaceNode = {
-      id: "win",
-      kind: "interface",
+    const channelInsideStructure: StructureElementNode = {
+      id: "panel",
+      kind: "structure",
       children: [
         {
-          id: "panel",
-          kind: "structure",
-          children: [
-            {
-              id: "cam",
-              kind: "channel",
-              mediaType: "video/h264",
-              direction: "sense",
-              deliveryMode: "stream",
-            } as unknown as InterfaceNode,
-          ],
-        },
+          id: "cam",
+          kind: "channel",
+          mediaType: "video/h264",
+          direction: "sense",
+          deliveryMode: "stream",
+        } as unknown as StructureElementNode,
       ],
     };
     assert.throws(
-      () => validateNode(channelInsideStructure, "body"),
+      () => validateNode(channelInsideStructure, "interface"),
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
     );
+
+    const channelInsideDocument: DocumentElementNode = {
+      id: "doc",
+      kind: "document",
+      children: [
+        {
+          id: "cam",
+          kind: "channel",
+          mediaType: "video/h264",
+          direction: "sense",
+          deliveryMode: "stream",
+        } as unknown as DocumentElementNode,
+      ],
+    };
+    assert.throws(
+      () => validateNode(channelInsideDocument, "interface"),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    for (const primitiveKind of ["view", "editable", "control"] as const) {
+      const channelInsidePrimitive = {
+        id: "prim",
+        kind: primitiveKind,
+        children: [
+          {
+            id: "cam",
+            kind: "channel",
+            mediaType: "video/h264",
+            direction: "sense",
+            deliveryMode: "stream",
+          },
+        ],
+      } as unknown as ViewElementNode;
+      assert.throws(
+        () => validateNode(channelInsidePrimitive, "interface"),
+        (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+      );
+
+      const ifaceInsidePrimitive = {
+        id: "prim",
+        kind: primitiveKind,
+        children: [{ id: "sub", kind: "interface" }],
+      } as unknown as ViewElementNode;
+      assert.throws(
+        () => validateNode(ifaceInsidePrimitive, "interface"),
+        (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+      );
+    }
+
+    const validComponent: ComponentElementNode = {
+      id: "comp",
+      kind: "component",
+      children: [
+        {
+          id: "ch",
+          kind: "channel",
+          mediaType: "video/h264",
+          direction: "sense",
+          deliveryMode: "stream",
+        },
+        { id: "slot", kind: "interface", type: "page" },
+      ],
+    };
+    assert.doesNotThrow(() => validateNode(validComponent, "interface"));
   });
 
-  it("enforces Channel leaf invariant, sibling uniqueness, acyclicity, and Content exclusivity", () => {
+  it("enforces Channel leaf invariant, sibling uniqueness, acyclicity, View exclusivity, Control statelessness, Properties/State validation, and Invariant 9", () => {
     const lazyChannel: ChannelNode = {
       id: "cam",
       kind: "channel",
@@ -223,16 +372,129 @@ describe("Formal Grammar Invariants", () => {
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
     );
 
-    const multiBoundContent: ContentElementNode = {
+    const multiBoundView: ViewElementNode = {
       id: "img",
-      kind: "content",
-      mediaType: "image/png",
-      temporalMode: "static",
-      value: "inline",
-      binaryRef: { refId: "b-1", mediaType: "image/png" },
+      kind: "view",
+      properties: { mediaType: "image/png", temporalMode: "static" },
+      state: {
+        value: "inline",
+        binaryRef: { refId: "b-1", mediaType: "image/png" },
+      },
     };
     assert.throws(
-      () => validateNode(multiBoundContent, "interface"),
+      () => validateNode(multiBoundView, "interface"),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    const viewValueAndChannel: ViewElementNode = {
+      id: "vid",
+      kind: "view",
+      state: {
+        value: "frame",
+        channelRef: "/cam",
+      },
+    };
+    assert.throws(
+      () => validateNode(viewValueAndChannel, "interface"),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    const statefulControl: ControlElementNode = {
+      id: "btn",
+      kind: "control",
+      type: "button",
+      state: { value: "should-fail" },
+    };
+    assert.throws(
+      () => validateNode(statefulControl, "interface"),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    const transientControl: ControlElementNode = {
+      id: "btn",
+      kind: "control",
+      type: "button",
+      state: { focused: true, pressed: false },
+    };
+    assert.doesNotThrow(() => validateNode(transientControl, "interface"));
+
+    assert.throws(
+      () =>
+        validateNode(
+          {
+            id: "v",
+            kind: "view",
+            properties: { temporalMode: "invalid-mode" },
+          },
+          "interface",
+        ),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    assert.throws(
+      () =>
+        validateNode(
+          {
+            id: "v",
+            kind: "view",
+            properties: { bounds: { x: 0, y: 0, width: -1, height: 10 } },
+          },
+          "interface",
+        ),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    assert.throws(
+      () =>
+        validateNode(
+          {
+            id: "v",
+            kind: "view",
+            properties: { "invalid key!": true },
+          },
+          "interface",
+        ),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    // Invariant 9: table children must be structure column|row; row children must be structure cell
+    const badTableChild: StructureElementNode = {
+      id: "tbl",
+      kind: "structure",
+      type: "table",
+      children: [{ id: "bad-cell", kind: "structure", type: "cell" }],
+    };
+    assert.throws(
+      () => validateNode(badTableChild, "interface"),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    const badTableViewChild: StructureElementNode = {
+      id: "tbl",
+      kind: "structure",
+      type: "table",
+      children: [{ id: "txt", kind: "view", type: "text" }],
+    };
+    assert.throws(
+      () => validateNode(badTableViewChild, "interface"),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
+
+    const badRowChild: StructureElementNode = {
+      id: "tbl",
+      kind: "structure",
+      type: "table",
+      children: [
+        {
+          id: "r1",
+          kind: "structure",
+          type: "row",
+          children: [{ id: "txt", kind: "view", type: "text" }],
+        },
+      ],
+    };
+    assert.throws(
+      () => validateNode(badRowChild, "interface"),
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
     );
 
@@ -244,7 +506,7 @@ describe("Formal Grammar Invariants", () => {
     );
   });
 
-  it("validates ChannelRef resolution and mount containment rules", () => {
+  it("validates state.channelRef resolution and mount containment rules", () => {
     const badTargetBody: BodyChild[] = [
       {
         id: "win",
@@ -252,10 +514,9 @@ describe("Formal Grammar Invariants", () => {
         children: [
           {
             id: "display",
-            kind: "content",
-            mediaType: "text/plain",
-            temporalMode: "dynamic",
-            channelRef: "/win", // points to Interface, not Channel
+            kind: "view",
+            properties: { mediaType: "text/plain", temporalMode: "dynamic" },
+            state: { channelRef: "/win" }, // points to Interface, not Channel
           },
         ],
       },
@@ -277,10 +538,9 @@ describe("Formal Grammar Invariants", () => {
         children: [
           {
             id: "feed",
-            kind: "content",
-            mediaType: "video/h264",
-            temporalMode: "dynamic",
-            channelRef: "/lazy-host/cam",
+            kind: "view",
+            properties: { mediaType: "video/h264", temporalMode: "dynamic" },
+            state: { channelRef: "/lazy-host/cam" },
           },
         ],
       },
@@ -299,6 +559,30 @@ describe("Formal Grammar Invariants", () => {
         children: [{ id: "term", kind: "interface" }],
       }),
     );
+    assert.doesNotThrow(() =>
+      validateMountContainment("component", {
+        path: "/",
+        kind: "body",
+        children: [
+          {
+            id: "cam",
+            kind: "channel",
+            mediaType: "video/h264",
+            direction: "sense",
+            deliveryMode: "stream",
+          },
+        ],
+      }),
+    );
+    assert.throws(
+      () =>
+        validateMountContainment("component", {
+          path: "/",
+          kind: "body",
+          children: [{ id: "sub-ou", kind: "ou" }],
+        }),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
     assert.throws(
       () =>
         validateMountContainment("interface", {
@@ -309,6 +593,26 @@ describe("Formal Grammar Invariants", () => {
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
     );
     assert.doesNotThrow(() => validateMountContainment("structure", { id: "iframe", kind: "interface" }));
+    assert.doesNotThrow(() => validateMountContainment("structure", { id: "player", kind: "component" }));
+    assert.doesNotThrow(() => validateMountContainment("document", { id: "guide-form", kind: "structure", type: "form" }));
+    assert.doesNotThrow(() =>
+      validateMountContainment("component", {
+        id: "ch",
+        kind: "channel",
+        mediaType: "audio/opus",
+        direction: "sense",
+        deliveryMode: "stream",
+      }),
+    );
+    assert.throws(
+      () =>
+        validateMountContainment(
+          "structure",
+          { id: "bad", kind: "view", type: "text" },
+          "table",
+        ),
+      (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
+    );
     assert.throws(
       () => validateMountContainment("interface", { id: "sub-ou", kind: "ou" }),
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
