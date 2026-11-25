@@ -30,6 +30,8 @@ import {
   type ChannelSeekResult,
   type ChannelSendParams,
   type ChannelSendResult,
+  type DataRenderParams,
+  type DataRenderResult,
   type EventDecl,
   type GetBinaryOptions,
   type GetBinaryResult,
@@ -40,6 +42,7 @@ import {
   type NodeGetResult,
   type NodeInvokeResult,
   type NodeLoadChildrenResult,
+  type NodeMovedParams,
   type NodeRemovedParams,
   type NodeState,
   type NodeUpdatedParams,
@@ -66,6 +69,7 @@ export interface CompositeMountOptions {
   methods?: MethodDecl[];
   events?: EventDecl[];
   mountKey?: string;
+  stripMetaPrefixes?: string[];
 }
 
 interface CompositeMountEntry {
@@ -80,6 +84,7 @@ interface CompositeMountEntry {
   meta?: MetaMap;
   methods?: MethodDecl[];
   events?: EventDecl[];
+  stripMetaPrefixes?: string[];
   unsubscribers: Array<() => void>;
 }
 
@@ -99,6 +104,7 @@ export class AepCompositeClient {
 
   private readonly nodeAddedHandlers = new Set<(event: NodeAddedParams) => void>();
   private readonly nodeUpdatedHandlers = new Set<(event: NodeUpdatedParams) => void>();
+  private readonly nodeMovedHandlers = new Set<(event: NodeMovedParams) => void>();
   private readonly nodeRemovedHandlers = new Set<(event: NodeRemovedParams) => void>();
   private readonly nodeEventHandlers = new Set<(event: NodeEventParams) => void>();
   private readonly channelChunkHandlers = new Set<(event: ChannelChunkParams) => void>();
@@ -162,6 +168,7 @@ export class AepCompositeClient {
       ...(options.meta !== undefined ? { meta: structuredClone(options.meta) } : {}),
       ...(options.methods !== undefined ? { methods: structuredClone(options.methods) } : {}),
       ...(options.events !== undefined ? { events: structuredClone(options.events) } : {}),
+      ...(options.stripMetaPrefixes ? { stripMetaPrefixes: [...options.stripMetaPrefixes] } : {}),
       unsubscribers: [],
     };
 
@@ -479,6 +486,11 @@ export class AepCompositeClient {
     path: Path,
     method: string,
     params?: unknown,
+    options?: {
+      expectedRevision?: number;
+      leaseId?: string;
+      grantId?: string;
+    },
   ): Promise<NodeInvokeResult<T>> {
     if (path === "/") {
       throw new AepError(AEP_ERROR_CODES.INVALID_PATH, 'node.invoke cannot target root "/"');
@@ -500,11 +512,53 @@ export class AepCompositeClient {
     }
 
     const downstreamPath = rebasePath(path, mount.anchorPath, mount.sourcePath)!;
-    const res = await mount.client.invoke<T>(downstreamPath, method, params);
+    const res = await mount.client.invoke<T>(downstreamPath, method, params, options);
     return {
       path,
       method,
+      ...(res.revision !== undefined ? { revision: res.revision } : {}),
       result: rewriteValueRefsForUpstream(res.result, mount.mountKey) as T,
+    };
+  }
+
+  async render(params: DataRenderParams): Promise<DataRenderResult> {
+    if (!params.path || params.path === "/") {
+      throw new AepError(AEP_ERROR_CODES.INVALID_PATH, "data.render requires non-root path");
+    }
+    const mount = this.findMountForPath(params.path);
+    if (!mount) {
+      throw new AepError(AEP_ERROR_CODES.NODE_NOT_FOUND, `Node not found at "${params.path}"`);
+    }
+    const downstreamPath = rebasePath(params.path, mount.anchorPath, mount.sourcePath)!;
+    const res = await mount.client.render({
+      ...params,
+      path: downstreamPath,
+    });
+    let rebasedMap: Record<string, Path> | undefined;
+    if (res.pathMap) {
+      rebasedMap = {};
+      for (const [k, v] of Object.entries(res.pathMap)) {
+        rebasedMap[k] = rebasePath(v, mount.sourcePath, mount.anchorPath) ?? v;
+      }
+    }
+    return {
+      ...res,
+      path: params.path,
+      ...(res.resolvedPath !== undefined
+        ? {
+            resolvedPath:
+              rebasePath(res.resolvedPath, mount.sourcePath, mount.anchorPath) ?? params.path,
+          }
+        : {}),
+      ...(res.reference !== undefined
+        ? {
+            reference: {
+              ...res.reference,
+              refId: toUpstreamRefId(mount.mountKey, res.reference.refId),
+            },
+          }
+        : {}),
+      ...(rebasedMap !== undefined ? { pathMap: rebasedMap } : {}),
     };
   }
 
@@ -546,12 +600,13 @@ export class AepCompositeClient {
     const compositeSub = new ClientChannelSubscription(
       {
         subscriptionId: compositeSubId,
-        ...(upstreamPath !== undefined ? { path: upstreamPath } : {}),
+        ...(upstreamPath !== undefined ? { path: upstreamPath, resolvedPath: upstreamPath } : {}),
         reference: {
           ...downSub.reference,
           refId: upstreamRefId,
         },
         direction: downSub.direction,
+        payloadMode: downSub.payloadMode,
       },
       {
         send: (sendParams) => this.sendChannel(sendParams),
@@ -600,7 +655,29 @@ export class AepCompositeClient {
         `Active composite subscription "${params.subscriptionId}" not found`,
       );
     }
+    if (sub.downstreamSub.payloadMode === "event") {
+      if (!params.event || params.data !== undefined) {
+        throw new AepError(
+          AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+          "Event channel requires event without data",
+        );
+      }
+      return await sub.downstreamSub.sendEvent(params.event, {
+        ...(params.leaseId !== undefined ? { leaseId: params.leaseId } : {}),
+        ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
+        ...(params.timestamp !== undefined ? { timestamp: params.timestamp } : {}),
+        ...(params.mediaType !== undefined ? { mediaType: params.mediaType } : {}),
+        ...(params.isFinal !== undefined ? { isFinal: params.isFinal } : {}),
+      });
+    }
+    if (!(params.data instanceof Uint8Array) || params.event !== undefined) {
+      throw new AepError(
+        AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+        "Binary channel requires data without event",
+      );
+    }
     return await sub.downstreamSub.send(params.data, {
+      ...(params.leaseId !== undefined ? { leaseId: params.leaseId } : {}),
       ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
       ...(params.timestamp !== undefined ? { timestamp: params.timestamp } : {}),
       ...(params.mediaType !== undefined ? { mediaType: params.mediaType } : {}),
@@ -681,6 +758,13 @@ export class AepCompositeClient {
     this.nodeUpdatedHandlers.add(handler);
     return () => {
       this.nodeUpdatedHandlers.delete(handler);
+    };
+  }
+
+  onNodeMoved(handler: (event: NodeMovedParams) => void): () => void {
+    this.nodeMovedHandlers.add(handler);
+    return () => {
+      this.nodeMovedHandlers.delete(handler);
     };
   }
 
@@ -858,6 +942,37 @@ export class AepCompositeClient {
         }
         for (const handler of this.nodeUpdatedHandlers) {
           handler({ path, node });
+        }
+      }),
+    );
+
+    entry.unsubscribers.push(
+      entry.client.onNodeMoved((ev) => {
+        if (!isPathWithin(ev.fromPath, entry.sourcePath) || !isPathWithin(ev.toPath, entry.sourcePath)) {
+          return;
+        }
+        const fromPath = rebasePath(ev.fromPath, entry.sourcePath, entry.anchorPath);
+        const toPath = rebasePath(ev.toPath, entry.sourcePath, entry.anchorPath);
+        if (!fromPath || !toPath) {
+          return;
+        }
+        const node = ev.node
+          ? rewriteNodeForUpstream(
+              ev.node,
+              entry.sourcePath,
+              entry.anchorPath,
+              entry.mountKey,
+              entry.stripMetaPrefixes,
+            )
+          : undefined;
+        for (const handler of this.nodeMovedHandlers) {
+          handler({
+            fromPath,
+            toPath,
+            ...(ev.uid !== undefined ? { uid: ev.uid } : {}),
+            ...(node !== undefined ? { node } : {}),
+            ...(ev.index !== undefined ? { index: ev.index } : {}),
+          });
         }
       }),
     );

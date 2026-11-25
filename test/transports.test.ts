@@ -100,7 +100,7 @@ async function verifyRoundTrip(client: AepClient, expectedLarge = false): Promis
 
   const sub = await client.openChannel({ path: "/device/telemetry" });
   const received: Uint8Array[] = [];
-  sub.onChunk((chunk) => received.push(chunk.data));
+  sub.onChunk((chunk) => received.push(chunk.data!));
   await sub.send(BINARY_SAMPLE);
   await new Promise((r) => setTimeout(r, 25));
   assert.equal(received.length, 1);

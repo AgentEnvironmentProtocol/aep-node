@@ -319,7 +319,7 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
     armServer.registerChannel("/gripper-loop", {
       async onSend(params, ctx) {
         await ctx.sendChunk({
-          data: new Uint8Array([params.data[0]! + 1]),
+          data: new Uint8Array([params.data![0]! + 1]),
         });
         return { accepted: true, sequence: params.sequence ?? 1 };
       },
@@ -414,7 +414,7 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
     // Multi-hop duplex streaming through Composite -> Robot -> Arm
     const sub = await composite.openChannel({ path: "/robot/right-arm/gripper-loop" });
     const feedback: number[][] = [];
-    sub.onChunk((c) => feedback.push([...c.data]));
+    sub.onChunk((c) => feedback.push([...c.data!]));
 
     await sub.send(new Uint8Array([0x20]));
     await new Promise((r) => setTimeout(r, 20));
@@ -645,7 +645,7 @@ describe("Passthrough Mounting and Multi-Root Composition", () => {
 
     const sub = await agent.openChannel({ path: viewport.node.state!.channelRef! });
     const frames: number[][] = [];
-    sub.onChunk((c) => frames.push([...c.data]));
+    sub.onChunk((c) => frames.push([...c.data!]));
     await new Promise((r) => setTimeout(r, 15));
     assert.deepEqual(frames, [[0xde, 0xad, 0xbe, 0xef]]);
 

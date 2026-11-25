@@ -32,6 +32,19 @@ function isBinaryReferenceResult(result: unknown): result is Record<string, unkn
   );
 }
 
+function isBinaryRenderResult(result: unknown): result is Record<string, unknown> {
+  if (!isPlainObject(result)) {
+    return false;
+  }
+  return (
+    typeof result["mode"] === "string" &&
+    typeof result["mediaType"] === "string" &&
+    Object.prototype.hasOwnProperty.call(result, "data") &&
+    !result["mediaType"].startsWith("text/") &&
+    result["mediaType"] !== "image/svg+xml"
+  );
+}
+
 export function validateControlEnvelope(value: unknown): ControlEnvelope {
   if (!isPlainObject(value)) {
     throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, "Envelope must be an object");
@@ -71,6 +84,15 @@ export function validateControlEnvelope(value: unknown): ControlEnvelope {
     if (typeof value["method"] !== "string" || value["method"].length === 0) {
       throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, "Notification envelope missing method");
     }
+    if (
+      value["seq"] !== undefined &&
+      (typeof value["seq"] !== "number" || !Number.isInteger(value["seq"]) || value["seq"] < 0)
+    ) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        "Notification envelope seq must be a non-negative integer",
+      );
+    }
     return value as unknown as ControlEnvelope;
   }
   throw new AepError(
@@ -103,7 +125,12 @@ function extractBinaryCarrier(envelope: ControlEnvelope): ExtractedBinaryPayload
     return null;
   }
 
-  if (envelope.kind === "response" && envelope.ok === true && isBinaryReferenceResult(envelope.result)) {
+  if (
+    envelope.kind === "response" &&
+    envelope.ok === true &&
+    isPlainObject(envelope.result) &&
+    (isBinaryReferenceResult(envelope.result) || isBinaryRenderResult(envelope.result))
+  ) {
     const bytes = toUint8Array(envelope.result["data"]);
     if (bytes) {
       const resultCopy: Record<string, unknown> = { ...envelope.result };
@@ -223,7 +250,8 @@ export class JsonTextCodec implements Codec {
     } else if (
       envelope.kind === "response" &&
       envelope.ok === true &&
-      isBinaryReferenceResult(envelope.result) &&
+      isPlainObject(envelope.result) &&
+      (isBinaryReferenceResult(envelope.result) || isBinaryRenderResult(envelope.result)) &&
       typeof envelope.result["data"] === "string"
     ) {
       return {

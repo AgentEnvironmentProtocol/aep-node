@@ -1,6 +1,7 @@
 import { AEP_ERROR_CODES, AepError } from "../core/errors.js";
 import { splitParentPath } from "../core/path.js";
 import { buildCapabilities } from "../core/profiles.js";
+import { synthesizeRenderMinimal } from "../core/render-minimal.js";
 import { cloneNode, findNodeInChildren } from "../core/tree-utils.js";
 import {
   AEP_PROTOCOL_VERSION,
@@ -21,24 +22,44 @@ import {
   type ChannelSendResult,
   type ClientInfo,
   type ControlEnvelope,
+  type DataRenderOptions,
+  type DataRenderParams,
+  type DataRenderResult,
   type GetBinaryOptions,
   type GetBinaryResult,
   type HeadUpdatedParams,
   type MetaMap,
   type NodeAddedParams,
   type NodeEventParams,
+  type NodeGetParams,
   type NodeGetResult,
+  type NodeInvokeParams,
   type NodeInvokeResult,
+  type NodeLoadChildrenParams,
   type NodeLoadChildrenResult,
+  type NodeMovedParams,
   type NodeRemovedParams,
   type NodeUpdatedParams,
   type NotificationEnvelope,
   type Path,
   type SecurityDescriptor,
   type ServerInfo,
+  type SessionAcquireLeaseParams,
+  type SessionAcquireLeaseResult,
+  type SessionAuthenticateParams,
+  type SessionAuthenticateResult,
+  type SessionAuthExpiringParams,
   type SessionDescriptor,
+  type SessionDropElevationResult,
+  type SessionElevateParams,
+  type SessionElevateResult,
+  type SessionElevationUpdatedParams,
   type SessionInitializeParams,
   type SessionInitializeResult,
+  type SessionLeaseUpdatedParams,
+  type SessionReleaseLeaseResult,
+  type SessionResumeParams,
+  type SessionResumeResult,
   type SessionRole,
   type TreeGetParams,
   type TreeGetResult,
@@ -76,7 +97,7 @@ const DEFAULT_CLIENT_INFO: ClientInfo = {
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 export class AepClient {
-  private readonly transport: Transport;
+  private transport: Transport;
   private readonly options: AepClientOptions;
   private readonly requestTimeoutMs: number;
   private readonly syncTree: boolean;
@@ -93,13 +114,21 @@ export class AepClient {
   private currentCapabilities?: CapabilitiesObject;
   private currentSession?: SessionDescriptor;
   private currentSecurity?: SecurityDescriptor;
+  private currentResumeToken?: string;
+  private currentControlSeq = 0;
   private syncedBody?: BodyChild[];
 
   private readonly headUpdatedHandlers = new Set<(event: HeadUpdatedParams) => void>();
   private readonly nodeAddedHandlers = new Set<(event: NodeAddedParams) => void>();
   private readonly nodeUpdatedHandlers = new Set<(event: NodeUpdatedParams) => void>();
+  private readonly nodeMovedHandlers = new Set<(event: NodeMovedParams) => void>();
   private readonly nodeRemovedHandlers = new Set<(event: NodeRemovedParams) => void>();
   private readonly nodeEventHandlers = new Set<(event: NodeEventParams) => void>();
+  private readonly authExpiringHandlers = new Set<(event: SessionAuthExpiringParams) => void>();
+  private readonly elevationUpdatedHandlers = new Set<
+    (event: SessionElevationUpdatedParams) => void
+  >();
+  private readonly leaseUpdatedHandlers = new Set<(event: SessionLeaseUpdatedParams) => void>();
   private readonly channelChunkHandlers = new Set<(event: ChannelChunkParams) => void>();
   private readonly channelClosedHandlers = new Set<(event: ChannelClosedParams) => void>();
   private readonly notificationHandlers = new Set<(envelope: NotificationEnvelope) => void>();
@@ -111,6 +140,16 @@ export class AepClient {
     this.options = options;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.syncTree = Boolean(options.syncTree);
+
+    this.attachTransportListeners(transport);
+  }
+
+  private attachTransportListeners(transport: Transport): void {
+    for (const unsub of this.unsubscribers) {
+      unsub();
+    }
+    this.unsubscribers.length = 0;
+    this.transport = transport;
 
     this.unsubscribers.push(
       transport.onMessage((envelope) => {
@@ -169,8 +208,43 @@ export class AepClient {
     return this.currentSecurity ? { ...this.currentSecurity } : undefined;
   }
 
+  get resumeToken(): string | undefined {
+    return this.currentResumeToken;
+  }
+
+  get lastControlSeq(): number {
+    return this.currentControlSeq;
+  }
+
   get cachedBody(): BodyChild[] | undefined {
     return this.syncedBody ? this.syncedBody.map((n) => cloneNode(n)) : undefined;
+  }
+
+  reattachTransport(transport: Transport): void {
+    this.closed = false;
+    this.attachTransportListeners(transport);
+  }
+
+  private applyAuthenticatedSessionState(
+    head: MetaMap | undefined,
+    session: SessionDescriptor | undefined,
+    security: SecurityDescriptor,
+  ): void {
+    if (head) {
+      this.currentHead = structuredClone(head);
+      const headCaps = head[HEAD_KEYS.CAPABILITIES];
+      if (headCaps && typeof headCaps === "object" && !Array.isArray(headCaps)) {
+        this.currentCapabilities = headCaps as unknown as CapabilitiesObject;
+      }
+    }
+    if (session) {
+      this.currentSession = session;
+      if (session.resumeToken !== undefined) {
+        this.currentResumeToken = session.resumeToken;
+      }
+    }
+    this.currentSecurity = security;
+    this.initialized = true;
   }
 
   async initialize(overrides?: Partial<SessionInitializeParams>): Promise<SessionInitializeResult> {
@@ -204,20 +278,107 @@ export class AepClient {
 
     this.currentProtocolVersion = result.protocolVersion;
     this.currentServerInfo = result.serverInfo;
-    this.currentHead = structuredClone(result.head);
-    this.currentSession = result.session;
     this.currentSecurity = result.security;
-    const headCaps = result.head[HEAD_KEYS.CAPABILITIES];
-    if (headCaps && typeof headCaps === "object" && !Array.isArray(headCaps)) {
-      this.currentCapabilities = headCaps as unknown as CapabilitiesObject;
+
+    if (result.authRequired) {
+      this.initialized = false;
+      return result;
     }
-    this.initialized = true;
+
+    this.applyAuthenticatedSessionState(result.head, result.session, result.security);
 
     if (this.syncTree) {
       await this.getTree({ path: "/", includeHead: true });
     }
 
     return result;
+  }
+
+  async authenticate(params: SessionAuthenticateParams): Promise<SessionAuthenticateResult> {
+    const result = (await this.sendRequest(
+      "session.authenticate",
+      params,
+    )) as SessionAuthenticateResult;
+    const wasInitialized = this.initialized;
+    this.applyAuthenticatedSessionState(
+      result.head,
+      result.session ?? this.currentSession,
+      result.security,
+    );
+    if (!wasInitialized && this.syncTree) {
+      await this.getTree({ path: "/", includeHead: true });
+    }
+    return result;
+  }
+
+  async resume(overrides?: Partial<SessionResumeParams>): Promise<SessionResumeResult> {
+    const sessionId = overrides?.sessionId ?? this.currentSession?.sessionId;
+    const resumeToken = overrides?.resumeToken ?? this.currentResumeToken;
+    if (!sessionId || !resumeToken) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_PARAMS,
+        "Cannot resume session without sessionId and resumeToken",
+      );
+    }
+
+    const subs =
+      overrides?.subscriptions ??
+      [...this.subscriptions.values()].map((s) => ({
+        subscriptionId: s.subscriptionId,
+        lastSequence: s.lastSequence,
+      }));
+
+    const params: SessionResumeParams = {
+      sessionId,
+      resumeToken,
+      lastControlSeq: overrides?.lastControlSeq ?? this.currentControlSeq,
+      subscriptions: subs,
+    };
+
+    const result = (await this.sendRequest("session.resume", params)) as SessionResumeResult;
+    this.currentResumeToken = result.resumeToken;
+    this.currentControlSeq = result.currentControlSeq;
+    if (result.head) {
+      this.currentHead = structuredClone(result.head);
+    }
+    this.initialized = true;
+
+    for (const st of result.subscriptions) {
+      if (st.status === "closed") {
+        const sub = this.subscriptions.get(st.subscriptionId);
+        if (sub) {
+          this.subscriptions.delete(st.subscriptionId);
+          sub._markClosed({
+            subscriptionId: st.subscriptionId,
+            refId: sub.reference.refId,
+            reason: "Closed during session disconnect",
+          });
+        }
+      }
+    }
+
+    return result;
+  }
+
+  async acquireLease(params: SessionAcquireLeaseParams): Promise<SessionAcquireLeaseResult> {
+    return (await this.sendRequest("session.acquireLease", params)) as SessionAcquireLeaseResult;
+  }
+
+  async releaseLease(leaseId: string): Promise<SessionReleaseLeaseResult> {
+    return (await this.sendRequest("session.releaseLease", {
+      leaseId,
+    })) as SessionReleaseLeaseResult;
+  }
+
+  async elevate(params: SessionElevateParams): Promise<SessionElevateResult> {
+    return (await this.sendRequest("session.elevate", params)) as SessionElevateResult;
+  }
+
+  async dropElevation(grantId?: string): Promise<SessionDropElevationResult> {
+    return (await this.sendRequest(
+      "session.dropElevation",
+      grantId !== undefined ? { grantId } : {},
+    )) as SessionDropElevationResult;
   }
 
   async close(reason?: string): Promise<void> {
@@ -253,25 +414,50 @@ export class AepClient {
     return (await this.sendRequest("tree.query", params)) as TreeQueryResult;
   }
 
-  async getNode(path: Path, options?: { maxDepth?: number }): Promise<NodeGetResult> {
-    return (await this.sendRequest("node.get", {
-      path,
-      ...(options?.maxDepth !== undefined ? { maxDepth: options.maxDepth } : {}),
-    })) as NodeGetResult;
+  async getNode(
+    pathOrParams: Path | NodeGetParams,
+    options?: { maxDepth?: number; uid?: string; followMoves?: boolean; grantId?: string },
+  ): Promise<NodeGetResult> {
+    const params: NodeGetParams =
+      typeof pathOrParams === "string"
+        ? {
+            path: pathOrParams,
+            ...(options?.maxDepth !== undefined ? { maxDepth: options.maxDepth } : {}),
+            ...(options?.uid !== undefined ? { uid: options.uid } : {}),
+            ...(options?.followMoves !== undefined ? { followMoves: options.followMoves } : {}),
+            ...(options?.grantId !== undefined ? { grantId: options.grantId } : {}),
+          }
+        : pathOrParams;
+    return (await this.sendRequest("node.get", params)) as NodeGetResult;
   }
 
   async loadChildren(
-    path: Path,
-    options?: { cursor?: string; limit?: number },
+    pathOrParams: Path | NodeLoadChildrenParams,
+    options?: {
+      cursor?: string;
+      limit?: number;
+      uid?: string;
+      followMoves?: boolean;
+      grantId?: string;
+    },
   ): Promise<NodeLoadChildrenResult> {
-    const res = (await this.sendRequest("node.loadChildren", {
-      path,
-      ...(options?.cursor !== undefined ? { cursor: options.cursor } : {}),
-      ...(options?.limit !== undefined ? { limit: options.limit } : {}),
-    })) as NodeLoadChildrenResult;
+    const params: NodeLoadChildrenParams =
+      typeof pathOrParams === "string"
+        ? {
+            path: pathOrParams,
+            ...(options?.cursor !== undefined ? { cursor: options.cursor } : {}),
+            ...(options?.limit !== undefined ? { limit: options.limit } : {}),
+            ...(options?.uid !== undefined ? { uid: options.uid } : {}),
+            ...(options?.followMoves !== undefined ? { followMoves: options.followMoves } : {}),
+            ...(options?.grantId !== undefined ? { grantId: options.grantId } : {}),
+          }
+        : pathOrParams;
 
-    if (this.syncTree && this.syncedBody) {
-      const target = findNodeInChildren(this.syncedBody, path);
+    const res = (await this.sendRequest("node.loadChildren", params)) as NodeLoadChildrenResult;
+
+    const targetPath = res.resolvedPath ?? res.path;
+    if (this.syncTree && this.syncedBody && targetPath) {
+      const target = findNodeInChildren(this.syncedBody, targetPath);
       if (target && target.kind !== "channel") {
         const existing = target.children ?? [];
         for (const child of res.children) {
@@ -291,22 +477,65 @@ export class AepClient {
   }
 
   async invoke<T = unknown>(
-    path: Path,
-    method: string,
+    pathOrParams: Path | NodeInvokeParams,
+    method?: string,
     params?: unknown,
+    options?: {
+      uid?: string;
+      followMoves?: boolean;
+      expectedRevision?: number;
+      leaseId?: string;
+      grantId?: string;
+    },
   ): Promise<NodeInvokeResult<T>> {
-    return (await this.sendRequest("node.invoke", {
-      path,
-      method,
-      ...(params !== undefined ? { params } : {}),
-    })) as NodeInvokeResult<T>;
+    const reqParams: NodeInvokeParams =
+      typeof pathOrParams === "string"
+        ? {
+            path: pathOrParams,
+            method: method!,
+            ...(params !== undefined ? { params } : {}),
+            ...(options?.uid !== undefined ? { uid: options.uid } : {}),
+            ...(options?.followMoves !== undefined ? { followMoves: options.followMoves } : {}),
+            ...(options?.expectedRevision !== undefined
+              ? { expectedRevision: options.expectedRevision }
+              : {}),
+            ...(options?.leaseId !== undefined ? { leaseId: options.leaseId } : {}),
+            ...(options?.grantId !== undefined ? { grantId: options.grantId } : {}),
+          }
+        : pathOrParams;
+
+    return (await this.sendRequest("node.invoke", reqParams)) as NodeInvokeResult<T>;
   }
 
-  async getBinary(refId: string, params?: GetBinaryOptions): Promise<GetBinaryResult> {
+  async getBinary(
+    refId: string,
+    params?: GetBinaryOptions,
+    options?: { grantId?: string },
+  ): Promise<GetBinaryResult> {
     return (await this.sendRequest("data.getBinary", {
       refId,
+      ...(options?.grantId !== undefined ? { grantId: options.grantId } : {}),
       ...(params !== undefined ? { params } : {}),
     })) as GetBinaryResult;
+  }
+
+  async render(params: DataRenderParams): Promise<DataRenderResult> {
+    return (await this.sendRequest("data.render", params)) as DataRenderResult;
+  }
+
+  async renderMinimal(
+    pathOrNode: Path | AepNode,
+    options?: DataRenderOptions,
+  ): Promise<DataRenderResult> {
+    if (typeof pathOrNode === "string") {
+      if (pathOrNode === "/") {
+        throw new AepError(AEP_ERROR_CODES.INVALID_PATH, 'renderMinimal cannot target root "/"');
+      }
+      const cached = this.syncedBody ? findNodeInChildren(this.syncedBody, pathOrNode) : undefined;
+      const node = cached ?? (await this.getNode(pathOrNode)).node;
+      return synthesizeRenderMinimal(node, pathOrNode, options);
+    }
+    return synthesizeRenderMinimal(pathOrNode, `/${pathOrNode.id}`, options);
   }
 
   async openChannel(params: ChannelOpenParams): Promise<ClientChannelSubscription> {
@@ -373,6 +602,13 @@ export class AepClient {
     };
   }
 
+  onNodeMoved(handler: (event: NodeMovedParams) => void): () => void {
+    this.nodeMovedHandlers.add(handler);
+    return () => {
+      this.nodeMovedHandlers.delete(handler);
+    };
+  }
+
   onNodeRemoved(handler: (event: NodeRemovedParams) => void): () => void {
     this.nodeRemovedHandlers.add(handler);
     return () => {
@@ -384,6 +620,27 @@ export class AepClient {
     this.nodeEventHandlers.add(handler);
     return () => {
       this.nodeEventHandlers.delete(handler);
+    };
+  }
+
+  onAuthExpiring(handler: (event: SessionAuthExpiringParams) => void): () => void {
+    this.authExpiringHandlers.add(handler);
+    return () => {
+      this.authExpiringHandlers.delete(handler);
+    };
+  }
+
+  onElevationUpdated(handler: (event: SessionElevationUpdatedParams) => void): () => void {
+    this.elevationUpdatedHandlers.add(handler);
+    return () => {
+      this.elevationUpdatedHandlers.delete(handler);
+    };
+  }
+
+  onLeaseUpdated(handler: (event: SessionLeaseUpdatedParams) => void): () => void {
+    this.leaseUpdatedHandlers.add(handler);
+    return () => {
+      this.leaseUpdatedHandlers.delete(handler);
     };
   }
 
@@ -499,6 +756,9 @@ export class AepClient {
   }
 
   private handleNotification(envelope: NotificationEnvelope): void {
+    if (typeof envelope.seq === "number" && envelope.seq > this.currentControlSeq) {
+      this.currentControlSeq = envelope.seq;
+    }
     for (const handler of this.notificationHandlers) {
       handler(envelope);
     }
@@ -528,6 +788,14 @@ export class AepClient {
         }
         break;
       }
+      case "node.moved": {
+        const params = envelope.params as NodeMovedParams;
+        this.applyNodeMoved(params);
+        for (const handler of this.nodeMovedHandlers) {
+          handler(params);
+        }
+        break;
+      }
       case "node.removed": {
         const params = envelope.params as NodeRemovedParams;
         this.applyNodeRemoved(params);
@@ -539,6 +807,27 @@ export class AepClient {
       case "node.event": {
         const params = envelope.params as NodeEventParams;
         for (const handler of this.nodeEventHandlers) {
+          handler(params);
+        }
+        break;
+      }
+      case "session.authExpiring": {
+        const params = envelope.params as SessionAuthExpiringParams;
+        for (const handler of this.authExpiringHandlers) {
+          handler(params);
+        }
+        break;
+      }
+      case "session.elevationUpdated": {
+        const params = envelope.params as SessionElevationUpdatedParams;
+        for (const handler of this.elevationUpdatedHandlers) {
+          handler(params);
+        }
+        break;
+      }
+      case "session.leaseUpdated": {
+        const params = envelope.params as SessionLeaseUpdatedParams;
+        for (const handler of this.leaseUpdatedHandlers) {
           handler(params);
         }
         break;
@@ -619,6 +908,32 @@ export class AepClient {
     }
   }
 
+  private applyNodeMoved(params: NodeMovedParams): void {
+    if (!this.syncTree || !this.syncedBody || params.fromPath === "/" || params.toPath === "/") {
+      return;
+    }
+    try {
+      const existing = findNodeInChildren(this.syncedBody, params.fromPath);
+      this.applyNodeRemoved({ path: params.fromPath });
+      const { parentPath, id } = splitParentPath(params.toPath);
+      const nodeToInsert = params.node
+        ? cloneNode(params.node)
+        : existing
+          ? cloneNode(existing)
+          : undefined;
+      if (nodeToInsert) {
+        nodeToInsert.id = id;
+        this.applyNodeAdded({
+          parentPath,
+          node: nodeToInsert,
+          ...(params.index !== undefined ? { index: params.index } : {}),
+        });
+      }
+    } catch {
+      // Ignore invalid paths on sync mirror
+    }
+  }
+
   private applyNodeRemoved(params: NodeRemovedParams): void {
     if (!this.syncTree || !this.syncedBody || params.path === "/") {
       return;
@@ -669,13 +984,21 @@ export class AepClient {
       );
     }
 
-    for (const [subId, sub] of this.subscriptions.entries()) {
-      this.subscriptions.delete(subId);
-      sub._markClosed({
-        subscriptionId: subId,
-        refId: sub.reference.refId,
-        reason: error?.message ?? "Transport closed",
-      });
+    const keepForResume =
+      this.initialized &&
+      this.currentCapabilities?.resumption?.enabled === true &&
+      typeof this.currentResumeToken === "string" &&
+      Boolean(error === undefined || !error.message.includes("Closed by"));
+
+    if (!keepForResume) {
+      for (const [subId, sub] of this.subscriptions.entries()) {
+        this.subscriptions.delete(subId);
+        sub._markClosed({
+          subscriptionId: subId,
+          refId: sub.reference.refId,
+          reason: error?.message ?? "Transport closed",
+        });
+      }
     }
 
     for (const handler of this.closeHandlers) {

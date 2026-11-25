@@ -5,6 +5,8 @@ export * from "./core/profiles.js";
 export * from "./core/validation.js";
 export * from "./core/tree-utils.js";
 export * from "./core/rewriting.js";
+export * from "./core/render-minimal.js";
+export * from "./core/config.js";
 export * from "./client/index.js";
 export * from "./server/index.js";
 export * from "./transport/index.js";

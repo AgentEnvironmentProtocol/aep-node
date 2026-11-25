@@ -6,6 +6,7 @@ import type {
   BodyRoot,
   CapabilitiesObject,
   ChannelNode,
+  ElevationSpec,
   EventDecl,
   MethodDecl,
   NodeKind,
@@ -24,14 +25,18 @@ const ELEMENT_KINDS: readonly NodeKind[] = [
 const VALID_NODE_KINDS = new Set<NodeKind>([
   "ou",
   "interface",
+  "api",
+  "endpoint",
   "channel",
   ...ELEMENT_KINDS,
 ]);
 
 const ALLOWED_CHILDREN: Record<NodeKind | "body", ReadonlySet<NodeKind>> = {
-  body: new Set<NodeKind>(["ou", "interface", "channel"]),
-  ou: new Set<NodeKind>(["ou", "interface", "channel"]),
+  body: new Set<NodeKind>(["ou", "interface", "api", "channel"]),
+  ou: new Set<NodeKind>(["ou", "interface", "api", "channel"]),
   interface: new Set<NodeKind>([...ELEMENT_KINDS, "interface", "channel"]),
+  api: new Set<NodeKind>(["endpoint", "api", "channel"]),
+  endpoint: new Set<NodeKind>(["endpoint", "channel"]),
   structure: new Set<NodeKind>([...ELEMENT_KINDS, "interface"]),
   component: new Set<NodeKind>([...ELEMENT_KINDS, "interface", "channel"]),
   document: new Set<NodeKind>([...ELEMENT_KINDS, "interface"]),
@@ -43,11 +48,20 @@ const ALLOWED_CHILDREN: Record<NodeKind | "body", ReadonlySet<NodeKind>> = {
 
 const VALID_DIRECTIONS = new Set(["sense", "act", "duplex"]);
 const VALID_DELIVERY_MODES = new Set(["stream", "stream+seek"]);
+const VALID_PAYLOAD_MODES = new Set(["binary", "event"]);
 const VALID_TEMPORAL_MODES = new Set(["static", "dynamic"]);
 const VALID_ORIENTATIONS = new Set(["horizontal", "vertical"]);
-const VALID_SEEK_UNITS = new Set(["ms", "seconds", "frames", "bytes", "samples"]);
+const VALID_SEEK_UNITS = new Set(["ms", "seconds", "frames", "bytes", "samples", "events"]);
 const VALID_INVOCATION_MODES = new Set(["request-response", "notification"]);
 const VALID_SIDE_EFFECTS = new Set(["none", "read", "write"]);
+const VALID_ELEVATION_LEVELS = new Set(["none", "confirm", "elevated", "admin"]);
+const VALID_ALLOWED_FACTORS = new Set([
+  "human-approval",
+  "totp",
+  "passkey",
+  "token",
+  "policy-attestation",
+]);
 const BOOLEAN_PROPERTY_KEYS = ["disabled", "readonly", "required", "editable", "modal"] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -79,11 +93,67 @@ function validateMetaMap(meta: unknown, context: string): void {
   validateKeyValueMapKeys(meta, "meta", context);
 }
 
-function validatePropertiesMap(properties: unknown, context: string): void {
+export function validateElevationSpec(spec: unknown, context: string): asserts spec is ElevationSpec {
+  if (!isPlainObject(spec)) {
+    throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, `${context}.elevation must be an object`);
+  }
+  if (typeof spec["level"] !== "string" || !VALID_ELEVATION_LEVELS.has(spec["level"])) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `${context}.elevation.level is invalid: "${String(spec["level"])}"`,
+    );
+  }
+  if (spec["scopes"] !== undefined) {
+    if (!Array.isArray(spec["scopes"]) || spec["scopes"].some((s) => typeof s !== "string" || s.length === 0)) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `${context}.elevation.scopes must be an array of non-empty strings`,
+      );
+    }
+  }
+  if (spec["allowedFactors"] !== undefined) {
+    if (
+      !Array.isArray(spec["allowedFactors"]) ||
+      spec["allowedFactors"].some((f) => typeof f !== "string" || !VALID_ALLOWED_FACTORS.has(f))
+    ) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `${context}.elevation.allowedFactors contains an invalid factor`,
+      );
+    }
+  }
+  if (spec["requireReason"] !== undefined && typeof spec["requireReason"] !== "boolean") {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `${context}.elevation.requireReason must be a boolean`,
+    );
+  }
+}
+
+function validatePropertiesMap(properties: unknown, kind: NodeKind, context: string): void {
   if (properties === undefined) {
     return;
   }
   validateKeyValueMapKeys(properties, "properties", context);
+
+  if (kind === "api" || kind === "endpoint") {
+    if (properties["bounds"] !== undefined) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `${context} of kind "${kind}" MUST NOT set properties.bounds`,
+      );
+    }
+    if (properties["capture"] !== undefined) {
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `${context} of kind "${kind}" MUST NOT set properties.capture`,
+      );
+    }
+  }
+
+  if (properties["elevation"] !== undefined) {
+    validateElevationSpec(properties["elevation"], `${context}.properties`);
+  }
 
   const temporalMode = properties["temporalMode"];
   if (
@@ -267,6 +337,9 @@ function validateMethodDecls(methods: unknown, context: string): void {
         `Invalid method sideEffects "${String(method.sideEffects)}" at ${context}.methods[${i}]`,
       );
     }
+    if (method.elevation !== undefined) {
+      validateElevationSpec(method.elevation, `${context}.methods[${i}]`);
+    }
     validateMetaMap(method.meta, `${context}.methods[${i}]`);
   }
 }
@@ -396,6 +469,18 @@ function validateChannelNode(node: ChannelNode, context: string): void {
       `Channel node "${context}" has invalid deliveryMode "${String(node.deliveryMode)}"`,
     );
   }
+  if (node.payloadMode !== undefined && !VALID_PAYLOAD_MODES.has(node.payloadMode)) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `Channel node "${context}" has invalid payloadMode "${String(node.payloadMode)}"`,
+    );
+  }
+  if (node.eventSchema !== undefined && !isPlainObject(node.eventSchema)) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `Channel node "${context}" eventSchema must be an object`,
+    );
+  }
   if (node.streamRef !== undefined) {
     validateStreamRef(node.streamRef, context);
   }
@@ -424,6 +509,21 @@ export function validateNode(
     );
   }
   const nodePath: Path = parentPath === "/" ? `/${node.id}` : `${parentPath}/${node.id}`;
+  if (node.uid !== undefined && (typeof node.uid !== "string" || node.uid.length === 0)) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `NodeUid must be a non-empty string at "${nodePath}"`,
+    );
+  }
+  if (
+    node.revision !== undefined &&
+    (typeof node.revision !== "number" || !Number.isInteger(node.revision) || node.revision < 0)
+  ) {
+    throw new AepError(
+      AEP_ERROR_CODES.INVALID_MESSAGE,
+      `Revision must be a non-negative integer at "${nodePath}"`,
+    );
+  }
   if (typeof node.kind !== "string" || !VALID_NODE_KINDS.has(node.kind)) {
     throw new AepError(
       AEP_ERROR_CODES.INVALID_MESSAGE,
@@ -452,7 +552,7 @@ export function validateNode(
     );
   }
 
-  validatePropertiesMap(node.properties, nodePath);
+  validatePropertiesMap(node.properties, node.kind, nodePath);
   validateStateMap(node.state, node.kind, nodePath);
   validateMetaMap(node.meta, nodePath);
   validateMethodDecls(node.methods, nodePath);
@@ -558,6 +658,28 @@ export function validateChannelRefs(body: readonly BodyChild[], strict = false):
   walk(body, "/");
 }
 
+function validateUniqueUids(body: readonly BodyChild[]): void {
+  const seen = new Set<string>();
+  const walk = (nodes: readonly AepNode[], parentPath: Path): void => {
+    for (const node of nodes) {
+      const nodePath = parentPath === "/" ? `/${node.id}` : `${parentPath}/${node.id}`;
+      if (node.uid !== undefined) {
+        if (seen.has(node.uid)) {
+          throw new AepError(
+            AEP_ERROR_CODES.INVALID_MESSAGE,
+            `Duplicate NodeUid "${node.uid}" at "${nodePath}"`,
+          );
+        }
+        seen.add(node.uid);
+      }
+      if (node.kind !== "channel" && node.children) {
+        walk(node.children, nodePath);
+      }
+    }
+  };
+  walk(body, "/");
+}
+
 export function validateBody(
   body: readonly BodyChild[],
   options: { checkChannelRefs?: boolean; strictChannelRefs?: boolean } = {},
@@ -577,6 +699,7 @@ export function validateBody(
     }
     topIds.add(child.id);
   }
+  validateUniqueUids(body);
   if (options.checkChannelRefs !== false) {
     validateChannelRefs(body, options.strictChannelRefs ?? false);
   }
@@ -613,6 +736,14 @@ export function validateNodeCapabilities(
         `Channel "${path}" uses unsupported deliveryMode "${node.deliveryMode}"`,
       );
     }
+    const payloadMode = node.payloadMode ?? "binary";
+    const allowedPayloadModes = capabilities.channelPayloadModes ?? ["binary"];
+    if (!allowedPayloadModes.includes(payloadMode)) {
+      throw new AepError(
+        AEP_ERROR_CODES.UNSUPPORTED_CAPABILITY,
+        `Channel "${path}" uses unsupported payloadMode "${payloadMode}"`,
+      );
+    }
     if (node.streamRef !== undefined && !capabilities.dataPlane.streamReferences) {
       throw new AepError(
         AEP_ERROR_CODES.UNSUPPORTED_CAPABILITY,
@@ -647,13 +778,28 @@ export function validateMountContainment(
       return;
     }
     if (anchorKind === "interface" || anchorKind === "component") {
-      const hasOu = target.children.some((child) => child.kind === "ou");
-      if (!hasOu) {
+      const hasDisallowed = target.children.some(
+        (child) => child.kind === "ou" || child.kind === "api",
+      );
+      if (!hasDisallowed) {
         return;
       }
       throw new AepError(
         AEP_ERROR_CODES.INVALID_MESSAGE,
-        `Cannot mount a Body containing "ou" nodes under a "${anchorKind}" anchor`,
+        `Cannot mount a Body containing "ou" or "api" nodes under a "${anchorKind}" anchor`,
+      );
+    }
+    if (anchorKind === "api") {
+      const hasDisallowed = target.children.some((child) => {
+        const k = child.kind as NodeKind;
+        return k !== "endpoint" && k !== "api" && k !== "channel";
+      });
+      if (!hasDisallowed) {
+        return;
+      }
+      throw new AepError(
+        AEP_ERROR_CODES.INVALID_MESSAGE,
+        `Cannot mount a Body containing non-API nodes under an "api" anchor`,
       );
     }
     throw new AepError(

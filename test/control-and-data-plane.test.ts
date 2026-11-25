@@ -169,6 +169,8 @@ describe("Control Plane and Data Plane", () => {
     assert.deepEqual(client.capabilities?.nodeKinds, [
       "ou",
       "interface",
+      "api",
+      "endpoint",
       "structure",
       "component",
       "document",
@@ -434,7 +436,7 @@ describe("Control Plane and Data Plane", () => {
 
     server.registerChannel("/workstation/motor", {
       onSend(params) {
-        sentPayloads.push(params.data);
+        sentPayloads.push(params.data!);
         return { accepted: true, sequence: params.sequence ?? 1 };
       },
     });
@@ -489,7 +491,7 @@ describe("Control Plane and Data Plane", () => {
 
     const received: number[][] = [];
     for await (const chunk of audioSub) {
-      received.push([...chunk.data]);
+      received.push([...chunk.data!]);
       if (chunk.isFinal) {
         await audioSub.close();
       }
@@ -514,7 +516,7 @@ describe("Control Plane and Data Plane", () => {
       unit: "ms",
     });
     assert.equal(sampled.offset, 12500);
-    assert.deepEqual([...sampled.data], [9, 8, 7]);
+    assert.deepEqual([...sampled.data!], [9, 8, 7]);
 
     const replaySub = await client.openChannel({ path: "/workstation/blackbox" });
     const seekRes = await replaySub.seek(42000, "ms");

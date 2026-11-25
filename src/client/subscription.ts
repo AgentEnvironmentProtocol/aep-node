@@ -2,6 +2,7 @@ import type {
   ChannelClosedParams,
   ChannelCloseResult,
   ChannelChunkParams,
+  ChannelEvent,
   ChannelOpenResult,
   ChannelSeekParams,
   ChannelSeekResult,
@@ -9,6 +10,7 @@ import type {
   ChannelSendResult,
   Direction,
   Path,
+  PayloadMode,
   SeekUnit,
   StreamRef,
 } from "../core/types.js";
@@ -24,8 +26,10 @@ const MAX_PRE_ITERATOR_BUFFER = 256;
 export class ClientChannelSubscription implements AsyncIterable<ChannelChunkParams> {
   readonly subscriptionId: string;
   readonly path?: Path;
+  readonly resolvedPath?: Path;
   readonly reference: StreamRef;
   readonly direction: Direction;
+  readonly payloadMode: PayloadMode;
 
   private readonly bridge: ClientSubscriptionBridge;
   private readonly chunkHandlers = new Set<(chunk: ChannelChunkParams) => void>();
@@ -35,14 +39,19 @@ export class ClientChannelSubscription implements AsyncIterable<ChannelChunkPara
   private iteratorActive = false;
   private closed = false;
   private closedEvent?: ChannelClosedParams;
+  private latestSequence = 0;
 
   constructor(info: ChannelOpenResult, bridge: ClientSubscriptionBridge) {
     this.subscriptionId = info.subscriptionId;
     if (info.path !== undefined) {
       this.path = info.path;
     }
+    if (info.resolvedPath !== undefined) {
+      this.resolvedPath = info.resolvedPath;
+    }
     this.reference = structuredClone(info.reference);
     this.direction = info.direction;
+    this.payloadMode = info.payloadMode ?? "binary";
     this.bridge = bridge;
   }
 
@@ -50,9 +59,14 @@ export class ClientChannelSubscription implements AsyncIterable<ChannelChunkPara
     return this.closed;
   }
 
+  get lastSequence(): number {
+    return this.latestSequence;
+  }
+
   async send(
     data: Uint8Array,
     options?: {
+      leaseId?: string;
       sequence?: number;
       timestamp?: string;
       mediaType?: string;
@@ -62,6 +76,28 @@ export class ClientChannelSubscription implements AsyncIterable<ChannelChunkPara
     return await this.bridge.send({
       subscriptionId: this.subscriptionId,
       data,
+      ...(options?.leaseId !== undefined ? { leaseId: options.leaseId } : {}),
+      ...(options?.sequence !== undefined ? { sequence: options.sequence } : {}),
+      ...(options?.timestamp !== undefined ? { timestamp: options.timestamp } : {}),
+      ...(options?.mediaType !== undefined ? { mediaType: options.mediaType } : {}),
+      ...(options?.isFinal !== undefined ? { isFinal: options.isFinal } : {}),
+    });
+  }
+
+  async sendEvent(
+    event: ChannelEvent,
+    options?: {
+      leaseId?: string;
+      sequence?: number;
+      timestamp?: string;
+      mediaType?: string;
+      isFinal?: boolean;
+    },
+  ): Promise<ChannelSendResult> {
+    return await this.bridge.send({
+      subscriptionId: this.subscriptionId,
+      event,
+      ...(options?.leaseId !== undefined ? { leaseId: options.leaseId } : {}),
       ...(options?.sequence !== undefined ? { sequence: options.sequence } : {}),
       ...(options?.timestamp !== undefined ? { timestamp: options.timestamp } : {}),
       ...(options?.mediaType !== undefined ? { mediaType: options.mediaType } : {}),
@@ -113,6 +149,9 @@ export class ClientChannelSubscription implements AsyncIterable<ChannelChunkPara
   }
 
   _pushChunk(chunk: ChannelChunkParams): void {
+    if (typeof chunk.sequence === "number" && chunk.sequence > this.latestSequence) {
+      this.latestSequence = chunk.sequence;
+    }
     for (const handler of this.chunkHandlers) {
       handler(chunk);
     }

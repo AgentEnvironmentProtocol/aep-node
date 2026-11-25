@@ -1,10 +1,19 @@
-import type { CapabilitiesObject, DeliveryMode, Direction, NodeKind } from "./types.js";
+import type {
+  CapabilitiesObject,
+  DeliveryMode,
+  Direction,
+  NodeKind,
+  PayloadMode,
+  RenderMode,
+} from "./types.js";
 
 export const AEP_CORE_STATIC_CAPABILITIES: CapabilitiesObject = {
   profile: "aep-core-static",
   nodeKinds: [
     "ou",
     "interface",
+    "api",
+    "endpoint",
     "structure",
     "component",
     "document",
@@ -14,6 +23,7 @@ export const AEP_CORE_STATIC_CAPABILITIES: CapabilitiesObject = {
   ],
   channelDirections: [],
   deliveryModes: [],
+  channelPayloadModes: [],
   queries: {
     treeQuery: true,
     loadChildren: true,
@@ -27,8 +37,15 @@ export const AEP_CORE_STATIC_CAPABILITIES: CapabilitiesObject = {
     seek: false,
     sample: false,
   },
+  rendering: {
+    serverModes: ["renderMinimal", "renderFull"],
+    formats: ["image/svg+xml", "image/png"],
+    pathAnnotations: true,
+  },
   security: {
     mode: "unauthenticated",
+    supportedModes: ["unauthenticated"],
+    elevation: false,
     reserved: true,
   },
 };
@@ -38,6 +55,8 @@ export const AEP_CORE_STREAMING_CAPABILITIES: CapabilitiesObject = {
   nodeKinds: [
     "ou",
     "interface",
+    "api",
+    "endpoint",
     "channel",
     "structure",
     "component",
@@ -48,6 +67,7 @@ export const AEP_CORE_STREAMING_CAPABILITIES: CapabilitiesObject = {
   ],
   channelDirections: ["sense", "act", "duplex"],
   deliveryModes: ["stream", "stream+seek"],
+  channelPayloadModes: ["binary", "event"],
   queries: {
     treeQuery: true,
     loadChildren: true,
@@ -58,6 +78,13 @@ export const AEP_CORE_STREAMING_CAPABILITIES: CapabilitiesObject = {
   sessions: {
     policy: "single-controller",
     allowObserverStreams: true,
+    leases: true,
+    optimisticConcurrency: true,
+  },
+  resumption: {
+    enabled: true,
+    replayWindowEvents: 1000,
+    sessionTtlMs: 300_000,
   },
   dataPlane: {
     binaryReferences: true,
@@ -65,8 +92,22 @@ export const AEP_CORE_STREAMING_CAPABILITIES: CapabilitiesObject = {
     seek: true,
     sample: true,
   },
+  rendering: {
+    serverModes: ["renderMinimal", "renderExpress", "renderFull"],
+    formats: ["image/svg+xml", "image/png", "text/x-aep-layout"],
+    pathAnnotations: true,
+  },
   security: {
     mode: "unauthenticated",
+    supportedModes: [
+      "unauthenticated",
+      "mtls",
+      "os-peer",
+      "bearer",
+      "api-key",
+      "challenge-response",
+    ],
+    elevation: true,
     reserved: true,
   },
 };
@@ -99,6 +140,11 @@ export function buildCapabilities(
     deliveryModes: profileOrPartial.deliveryModes
       ? [...profileOrPartial.deliveryModes]
       : base.deliveryModes,
+    channelPayloadModes: profileOrPartial.channelPayloadModes
+      ? [...profileOrPartial.channelPayloadModes]
+      : base.channelPayloadModes
+        ? [...base.channelPayloadModes]
+        : undefined,
     queries: {
       ...base.queries,
       ...profileOrPartial.queries,
@@ -118,13 +164,52 @@ export function buildCapabilities(
             ...profileOrPartial.sessions,
           }
         : undefined,
+    resumption:
+      base.resumption || profileOrPartial.resumption
+        ? {
+            enabled:
+              profileOrPartial.resumption?.enabled ?? base.resumption?.enabled ?? false,
+            ...(profileOrPartial.resumption?.replayWindowEvents !== undefined
+              ? { replayWindowEvents: profileOrPartial.resumption.replayWindowEvents }
+              : base.resumption?.replayWindowEvents !== undefined
+                ? { replayWindowEvents: base.resumption.replayWindowEvents }
+                : {}),
+            ...(profileOrPartial.resumption?.sessionTtlMs !== undefined
+              ? { sessionTtlMs: profileOrPartial.resumption.sessionTtlMs }
+              : base.resumption?.sessionTtlMs !== undefined
+                ? { sessionTtlMs: base.resumption.sessionTtlMs }
+                : {}),
+          }
+        : undefined,
     dataPlane: {
       ...base.dataPlane,
       ...profileOrPartial.dataPlane,
     },
+    rendering:
+      base.rendering || profileOrPartial.rendering
+        ? {
+            ...base.rendering,
+            ...profileOrPartial.rendering,
+            ...(profileOrPartial.rendering?.serverModes
+              ? { serverModes: [...profileOrPartial.rendering.serverModes] }
+              : base.rendering?.serverModes
+                ? { serverModes: [...base.rendering.serverModes] }
+                : {}),
+            ...(profileOrPartial.rendering?.formats
+              ? { formats: [...profileOrPartial.rendering.formats] }
+              : base.rendering?.formats
+                ? { formats: [...base.rendering.formats] }
+                : {}),
+          }
+        : undefined,
     security: {
       ...base.security,
       ...profileOrPartial.security,
+      ...(profileOrPartial.security?.supportedModes
+        ? { supportedModes: [...profileOrPartial.security.supportedModes] }
+        : base.security.supportedModes
+          ? { supportedModes: [...base.security.supportedModes] }
+          : {}),
     },
     ...(profileOrPartial.vocabularies !== undefined
       ? { vocabularies: [...profileOrPartial.vocabularies] }
@@ -156,15 +241,24 @@ export function negotiateCapabilities(
   const clientNodeKinds = client?.nodeKinds ?? clientBase?.nodeKinds;
   const clientDirections = client?.channelDirections ?? clientBase?.channelDirections;
   const clientDeliveryModes = client?.deliveryModes ?? clientBase?.deliveryModes;
+  const clientPayloadModes = client?.channelPayloadModes ?? clientBase?.channelPayloadModes;
   const clientQueries = client?.queries ?? clientBase?.queries;
   const clientPassthrough = client?.passthrough ?? clientBase?.passthrough;
   const clientDataPlane = client?.dataPlane ?? clientBase?.dataPlane;
   const clientSessions = client?.sessions ?? clientBase?.sessions;
+  const clientResumption = client?.resumption ?? clientBase?.resumption;
+  const clientRendering = client?.rendering ?? clientBase?.rendering;
   const clientVocabularies = client?.vocabularies ?? clientBase?.vocabularies;
 
   const nodeKinds: NodeKind[] = intersectList(server.nodeKinds, clientNodeKinds);
   const channelDirections: Direction[] = intersectList(server.channelDirections, clientDirections);
   const deliveryModes: DeliveryMode[] = intersectList(server.deliveryModes, clientDeliveryModes);
+  const serverPayloadModes: PayloadMode[] =
+    server.channelPayloadModes ?? (nodeKinds.includes("channel") ? ["binary"] : []);
+  const channelPayloadModes: PayloadMode[] = intersectList(
+    serverPayloadModes,
+    clientPayloadModes,
+  );
 
   const queries = {
     treeQuery: (server.queries?.treeQuery ?? true) && (clientQueries?.treeQuery ?? true),
@@ -197,8 +291,58 @@ export function negotiateCapabilities(
           allowObserverStreams:
             (server.sessions?.allowObserverStreams ?? true) &&
             (clientSessions?.allowObserverStreams ?? true),
+          ...(server.sessions?.leases !== undefined || clientSessions?.leases !== undefined
+            ? {
+                leases:
+                  (server.sessions?.leases ?? false) &&
+                  (clientSessions?.leases ?? true),
+              }
+            : {}),
+          ...(server.sessions?.optimisticConcurrency !== undefined ||
+          clientSessions?.optimisticConcurrency !== undefined
+            ? {
+                optimisticConcurrency:
+                  (server.sessions?.optimisticConcurrency ?? false) &&
+                  (clientSessions?.optimisticConcurrency ?? true),
+              }
+            : {}),
         }
       : undefined;
+
+  const resumption = server.resumption
+    ? {
+        enabled: server.resumption.enabled && (clientResumption?.enabled ?? true),
+        ...(server.resumption.replayWindowEvents !== undefined
+          ? { replayWindowEvents: server.resumption.replayWindowEvents }
+          : {}),
+        ...(server.resumption.sessionTtlMs !== undefined
+          ? { sessionTtlMs: server.resumption.sessionTtlMs }
+          : {}),
+      }
+    : undefined;
+
+  const rendering = server.rendering
+    ? {
+        ...(server.rendering.serverModes
+          ? {
+              serverModes: intersectList<RenderMode>(
+                server.rendering.serverModes,
+                clientRendering?.serverModes,
+              ),
+            }
+          : {}),
+        ...(server.rendering.formats
+          ? { formats: intersectList(server.rendering.formats, clientRendering?.formats) }
+          : {}),
+        ...(server.rendering.pathAnnotations !== undefined
+          ? {
+              pathAnnotations:
+                server.rendering.pathAnnotations &&
+                (clientRendering?.pathAnnotations ?? true),
+            }
+          : {}),
+      }
+    : undefined;
 
   let vocabularies: string[] | undefined;
   if (server.vocabularies && clientVocabularies) {
@@ -219,6 +363,8 @@ export function negotiateCapabilities(
     nodeKinds.includes("channel") &&
     nodeKinds.includes("ou") &&
     nodeKinds.includes("interface") &&
+    nodeKinds.includes("api") &&
+    nodeKinds.includes("endpoint") &&
     nodeKinds.includes("structure") &&
     nodeKinds.includes("component") &&
     nodeKinds.includes("document") &&
@@ -248,11 +394,19 @@ export function negotiateCapabilities(
     nodeKinds,
     channelDirections,
     deliveryModes,
+    channelPayloadModes,
     queries,
     passthrough,
     ...(sessions !== undefined ? { sessions } : {}),
+    ...(resumption !== undefined ? { resumption } : {}),
     dataPlane,
-    security: { ...server.security },
+    ...(rendering !== undefined ? { rendering } : {}),
+    security: {
+      ...server.security,
+      ...(server.security.supportedModes
+        ? { supportedModes: [...server.security.supportedModes] }
+        : {}),
+    },
     ...(vocabularies !== undefined ? { vocabularies } : {}),
   };
 }

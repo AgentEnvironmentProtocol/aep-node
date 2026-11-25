@@ -1,12 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { AEP_ERROR_CODES, AepError } from "../core/errors.js";
-import { isValidPath } from "../core/path.js";
+import { isPathWithin, isValidPath, rebasePath } from "../core/path.js";
 import type {
   AepNode,
   AepValue,
   BinaryRef,
   BodyChild,
   CapabilitiesObject,
+  ChannelChunkParams,
+  ChannelEvent,
   ChannelNode,
   ChannelOpenOptions,
   ChannelOpenParams,
@@ -21,6 +23,9 @@ import type {
   GetBinaryParams,
   GetBinaryResult,
   Path,
+  PayloadMode,
+  PrincipalDescriptor,
+  ResumedSubscriptionStatus,
   SeekUnit,
   SessionRole,
   StreamRef,
@@ -32,6 +37,7 @@ export interface ServerSessionContext {
   readonly role: SessionRole;
   readonly capabilities: CapabilitiesObject;
   readonly peerIdentity?: Record<string, AepValue>;
+  readonly principal?: PrincipalDescriptor;
 }
 
 export type BinaryProviderResult =
@@ -39,6 +45,7 @@ export type BinaryProviderResult =
   | {
       reference?: Partial<BinaryRef>;
       data: Uint8Array;
+      pathMap?: Record<string, Path>;
     };
 
 export type BinaryProviderFn = (
@@ -47,7 +54,8 @@ export type BinaryProviderFn = (
 ) => Promise<BinaryProviderResult> | BinaryProviderResult;
 
 export interface ChannelChunkInput {
-  data: Uint8Array;
+  data?: Uint8Array;
+  event?: ChannelEvent;
   mediaType?: string;
   timestamp?: string;
   offset?: number;
@@ -59,10 +67,20 @@ export interface ChannelSubscriptionContext {
   readonly path: Path;
   readonly channel: ChannelNode;
   readonly reference: StreamRef;
+  readonly payloadMode: PayloadMode;
   readonly session: ServerSessionContext;
   readonly params?: ChannelOpenOptions;
   sendChunk(chunk: ChannelChunkInput): Promise<void>;
   close(reason?: string): Promise<void>;
+}
+
+export interface ServerChannelSampleOutput {
+  data?: Uint8Array;
+  event?: ChannelEvent;
+  mediaType?: string;
+  timestamp?: string;
+  offset?: number;
+  unit?: SeekUnit;
 }
 
 export interface ServerChannelHandler {
@@ -79,19 +97,7 @@ export interface ServerChannelHandler {
     params: ChannelSampleParams,
     channel: ChannelNode,
     session: ServerSessionContext,
-  ): Promise<{
-    data: Uint8Array;
-    mediaType?: string;
-    timestamp?: string;
-    offset?: number;
-    unit?: SeekUnit;
-  }> | {
-    data: Uint8Array;
-    mediaType?: string;
-    timestamp?: string;
-    offset?: number;
-    unit?: SeekUnit;
-  };
+  ): Promise<ServerChannelSampleOutput> | ServerChannelSampleOutput;
   onClose?(ctx: ChannelSubscriptionContext): Promise<void> | void;
 }
 
@@ -105,16 +111,21 @@ interface ActiveSubscription {
   path: Path;
   channel: ChannelNode;
   reference: StreamRef;
+  payloadMode: PayloadMode;
   session: ServerSessionContext;
   params?: ChannelOpenOptions;
   handler?: ServerChannelHandler;
   emit: (method: string, params: unknown) => Promise<void>;
   sequence: number;
   ready: boolean;
+  detached: boolean;
   pendingNotifications: Array<{ method: string; payload: unknown }>;
+  chunkHistory: ChannelChunkParams[];
   closed: boolean;
   ctx: ChannelSubscriptionContext;
 }
+
+const MAX_CHUNK_HISTORY = 1000;
 
 function findChannelByRefId(
   children: readonly BodyChild[],
@@ -164,6 +175,23 @@ function validateRegionParam(region: unknown): void {
       "region requires finite x, y, width >= 0, height >= 0",
     );
   }
+}
+
+function isValidChannelEvent(value: unknown): value is ChannelEvent {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, "payload")) {
+    return false;
+  }
+  if (record["name"] !== undefined && typeof record["name"] !== "string") {
+    return false;
+  }
+  if (record["id"] !== undefined && typeof record["id"] !== "string") {
+    return false;
+  }
+  return true;
 }
 
 export class DataPlaneManager {
@@ -250,18 +278,45 @@ export class DataPlaneManager {
     return {
       reference: mergedRef,
       data: result.data,
+      ...(result.pathMap !== undefined ? { pathMap: result.pathMap } : {}),
     };
   }
 
   resolveChannelTarget(
     path?: Path,
     refId?: string,
+    uid?: string,
+    followMoves?: boolean,
   ): { path: Path; channel: ChannelNode } {
-    if ((path === undefined || path === "") && (refId === undefined || refId === "")) {
+    if (
+      (path === undefined || path === "") &&
+      (refId === undefined || refId === "") &&
+      (uid === undefined || uid === "")
+    ) {
       throw new AepError(
         AEP_ERROR_CODES.INVALID_PARAMS,
-        "At least one of path or refId MUST be provided",
+        "At least one of path, uid, or refId MUST be provided",
       );
+    }
+
+    const shouldFollowMoves = uid !== undefined ? (followMoves ?? true) : (followMoves ?? false);
+
+    let byUid: { path: Path; channel: ChannelNode } | undefined;
+    if (uid !== undefined) {
+      if (typeof uid !== "string" || uid.length === 0) {
+        throw new AepError(AEP_ERROR_CODES.INVALID_PARAMS, "uid must be a non-empty string");
+      }
+      const found = this.treeStore.findNodeByUidInternal(uid);
+      if (!found) {
+        throw new AepError(AEP_ERROR_CODES.NODE_NOT_FOUND, `Channel with uid "${uid}" not found`);
+      }
+      if (found.node.kind !== "channel") {
+        throw new AepError(
+          AEP_ERROR_CODES.CHANNEL_NOT_FOUND,
+          `Node with uid "${uid}" at "${found.path}" is not a channel`,
+        );
+      }
+      byUid = { path: found.path, channel: found.node };
     }
 
     let byPath: { path: Path; channel: ChannelNode } | undefined;
@@ -270,13 +325,40 @@ export class DataPlaneManager {
         throw new AepError(AEP_ERROR_CODES.INVALID_PATH, `Invalid channel path: "${path}"`);
       }
       const node = this.treeStore.findNodeInternal(path);
-      if (!node || node.kind !== "channel") {
+      if (!node) {
+        const moved = this.treeStore.resolveMove(path);
+        if (moved) {
+          if (shouldFollowMoves) {
+            const relocated = this.treeStore.findNodeInternal(moved.toPath);
+            if (relocated && relocated.kind === "channel") {
+              byPath = { path: moved.toPath, channel: relocated };
+            }
+          } else {
+            throw new AepError(
+              AEP_ERROR_CODES.NODE_MOVED,
+              `Channel at "${path}" moved to "${moved.toPath}"`,
+              moved,
+            );
+          }
+        }
+        if (!byPath) {
+          if (byUid && shouldFollowMoves) {
+            byPath = byUid;
+          } else {
+            throw new AepError(
+              AEP_ERROR_CODES.CHANNEL_NOT_FOUND,
+              `Channel not found at path "${path}"`,
+            );
+          }
+        }
+      } else if (node.kind !== "channel") {
         throw new AepError(
           AEP_ERROR_CODES.CHANNEL_NOT_FOUND,
-          `Channel not found at path "${path}"`,
+          `Node at path "${path}" is not a channel`,
         );
+      } else {
+        byPath = { path, channel: node };
       }
-      byPath = { path, channel: node };
     }
 
     let byRef: { path: Path; channel: ChannelNode } | undefined;
@@ -301,18 +383,43 @@ export class DataPlaneManager {
       }
     }
 
-    if (byPath && byRef && byPath.path !== byRef.path) {
-      throw new AepError(
-        AEP_ERROR_CODES.INVALID_PARAMS,
-        `Channel path "${byPath.path}" and refId "${refId}" resolve to different channels`,
-      );
+    const targets = [byPath, byUid, byRef].filter(
+      (t): t is { path: Path; channel: ChannelNode } => t !== undefined,
+    );
+    const primary = targets[0]!;
+    for (let i = 1; i < targets.length; i += 1) {
+      if (targets[i]!.path !== primary.path) {
+        throw new AepError(
+          AEP_ERROR_CODES.INVALID_PARAMS,
+          `Channel targets resolve to different channels ("${primary.path}" vs "${targets[i]!.path}")`,
+        );
+      }
     }
 
-    return (byPath ?? byRef)!;
+    return primary;
   }
 
   private lookupHandler(path: Path, refId?: string): ServerChannelHandler | undefined {
     return this.channelHandlers.get(path) ?? (refId ? this.channelHandlers.get(refId) : undefined);
+  }
+
+  getSubscription(subscriptionId: string): { path: Path; channel: ChannelNode; sessionId: string } | undefined {
+    const sub = this.subscriptions.get(subscriptionId);
+    if (!sub || sub.closed) {
+      return undefined;
+    }
+    return { path: sub.path, channel: sub.channel, sessionId: sub.session.sessionId };
+  }
+
+  relocatePath(fromPath: Path, toPath: Path): void {
+    for (const sub of this.subscriptions.values()) {
+      if (isPathWithin(sub.path, fromPath)) {
+        const rebased = rebasePath(sub.path, fromPath, toPath);
+        if (rebased) {
+          sub.path = rebased;
+        }
+      }
+    }
   }
 
   async openChannel(
@@ -330,7 +437,12 @@ export class DataPlaneManager {
       );
     }
 
-    const { path, channel } = this.resolveChannelTarget(params?.path, params?.refId);
+    const { path, channel } = this.resolveChannelTarget(
+      params?.path,
+      params?.refId,
+      params?.uid,
+      params?.followMoves,
+    );
 
     if (!session.capabilities.channelDirections.includes(channel.direction)) {
       throw new AepError(
@@ -342,6 +454,14 @@ export class DataPlaneManager {
       throw new AepError(
         AEP_ERROR_CODES.UNSUPPORTED_CAPABILITY,
         `Channel deliveryMode "${channel.deliveryMode}" is outside negotiated capabilities`,
+      );
+    }
+    const payloadMode: PayloadMode = channel.payloadMode ?? "binary";
+    const allowedPayloadModes = session.capabilities.channelPayloadModes ?? ["binary"];
+    if (!allowedPayloadModes.includes(payloadMode)) {
+      throw new AepError(
+        AEP_ERROR_CODES.UNSUPPORTED_CAPABILITY,
+        `Channel payloadMode "${payloadMode}" is outside negotiated capabilities`,
       );
     }
 
@@ -378,22 +498,28 @@ export class DataPlaneManager {
       path,
       channel,
       reference,
+      payloadMode,
       session,
       params: params?.params,
       handler,
       emit,
       sequence: 0,
       ready: false,
+      detached: false,
       pendingNotifications: [],
+      chunkHistory: [],
       closed: false,
       ctx: null as unknown as ChannelSubscriptionContext,
     };
 
     const ctx: ChannelSubscriptionContext = {
       subscriptionId,
-      path,
+      get path() {
+        return sub.path;
+      },
       channel,
       reference,
+      payloadMode,
       session,
       params: params?.params,
       sendChunk: async (chunk) => {
@@ -403,22 +529,51 @@ export class DataPlaneManager {
         if (channel.direction === "act") {
           throw new AepError(
             AEP_ERROR_CODES.DIRECTION_MISMATCH,
-            `Cannot push server chunks on "act"-only channel "${path}"`,
+            `Cannot push server chunks on "act"-only channel "${sub.path}"`,
           );
         }
+        if (sub.payloadMode === "binary") {
+          if (!(chunk.data instanceof Uint8Array) || chunk.event !== undefined) {
+            throw new AepError(
+              AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+              `Binary channel "${sub.path}" requires Uint8Array data without event`,
+            );
+          }
+        } else {
+          if (!isValidChannelEvent(chunk.event) || chunk.data !== undefined) {
+            throw new AepError(
+              AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+              `Event channel "${sub.path}" requires ChannelEvent in event without data`,
+            );
+          }
+          const filterNames = sub.params?.eventFilter?.names;
+          if (filterNames && filterNames.length > 0) {
+            if (!chunk.event.name || !filterNames.includes(chunk.event.name)) {
+              return;
+            }
+          }
+        }
+
         sub.sequence += 1;
-        const payload = {
+        const payload: ChannelChunkParams = {
           subscriptionId: sub.subscriptionId,
           refId: sub.reference.refId,
           sequence: sub.sequence,
           timestamp: chunk.timestamp ?? new Date().toISOString(),
           mediaType: chunk.mediaType ?? sub.channel.mediaType,
           ...(chunk.offset !== undefined ? { offset: chunk.offset } : {}),
-          data: chunk.data,
+          ...(chunk.data !== undefined ? { data: chunk.data } : {}),
+          ...(chunk.event !== undefined ? { event: structuredClone(chunk.event) } : {}),
           ...(chunk.isFinal !== undefined ? { isFinal: chunk.isFinal } : {}),
         };
-        if (!sub.ready) {
-          sub.pendingNotifications.push({ method: "channel.chunk", payload });
+        sub.chunkHistory.push(payload);
+        if (sub.chunkHistory.length > MAX_CHUNK_HISTORY) {
+          sub.chunkHistory.shift();
+        }
+        if (!sub.ready || sub.detached) {
+          if (!sub.ready) {
+            sub.pendingNotifications.push({ method: "channel.chunk", payload });
+          }
           return;
         }
         await sub.emit("channel.chunk", payload);
@@ -444,8 +599,10 @@ export class DataPlaneManager {
     return {
       subscriptionId,
       path,
+      resolvedPath: path,
       reference: structuredClone(reference),
       direction: channel.direction,
+      payloadMode,
     };
   }
 
@@ -453,10 +610,10 @@ export class DataPlaneManager {
     params: ChannelSendParams,
     session: ServerSessionContext,
   ): Promise<ChannelSendResult> {
-    if (!params || typeof params.subscriptionId !== "string" || !(params.data instanceof Uint8Array)) {
+    if (!params || typeof params.subscriptionId !== "string") {
       throw new AepError(
         AEP_ERROR_CODES.INVALID_PARAMS,
-        "channel.send requires subscriptionId and Uint8Array data",
+        "channel.send requires subscriptionId",
       );
     }
 
@@ -480,6 +637,22 @@ export class DataPlaneManager {
         AEP_ERROR_CODES.DIRECTION_MISMATCH,
         `Cannot call channel.send on "sense"-only channel "${sub.path}"`,
       );
+    }
+
+    if (sub.payloadMode === "binary") {
+      if (!(params.data instanceof Uint8Array) || params.event !== undefined) {
+        throw new AepError(
+          AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+          `Binary channel "${sub.path}" requires data and MUST NOT include event`,
+        );
+      }
+    } else {
+      if (!isValidChannelEvent(params.event) || params.data !== undefined) {
+        throw new AepError(
+          AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+          `Event channel "${sub.path}" requires event and MUST NOT include data`,
+        );
+      }
     }
 
     if (sub.handler?.onSend) {
@@ -565,7 +738,12 @@ export class DataPlaneManager {
       );
     }
 
-    const { path, channel } = this.resolveChannelTarget(params.path, params.refId);
+    const { path, channel } = this.resolveChannelTarget(
+      params.path,
+      params.refId,
+      params.uid,
+      params.followMoves,
+    );
     if (channel.deliveryMode !== "stream+seek" || channel.streamRef?.seek?.seekable === false) {
       throw new AepError(
         AEP_ERROR_CODES.UNSUPPORTED_CAPABILITY,
@@ -585,15 +763,30 @@ export class DataPlaneManager {
     }
 
     const sampled = await handler.onSample(params, channel, session);
+    const payloadMode: PayloadMode = channel.payloadMode ?? "binary";
+    if (payloadMode === "binary" && (!(sampled.data instanceof Uint8Array) || sampled.event !== undefined)) {
+      throw new AepError(
+        AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+        `Binary channel "${path}" sample must return data without event`,
+      );
+    }
+    if (payloadMode === "event" && (!isValidChannelEvent(sampled.event) || sampled.data !== undefined)) {
+      throw new AepError(
+        AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+        `Event channel "${path}" sample must return event without data`,
+      );
+    }
     const unit = sampled.unit ?? params.unit ?? reference.seek?.unit;
 
     return {
       reference,
+      resolvedPath: path,
       offset: sampled.offset ?? params.offset,
       ...(unit !== undefined ? { unit } : {}),
       mediaType: sampled.mediaType ?? channel.mediaType,
       ...(sampled.timestamp !== undefined ? { timestamp: sampled.timestamp } : {}),
-      data: sampled.data,
+      ...(sampled.data !== undefined ? { data: sampled.data } : {}),
+      ...(sampled.event !== undefined ? { event: structuredClone(sampled.event) } : {}),
     };
   }
 
@@ -662,6 +855,9 @@ export class DataPlaneManager {
       sub.pendingNotifications.push({ method: "channel.closed", payload });
       return;
     }
+    if (sub.detached) {
+      return;
+    }
     try {
       await sub.emit("channel.closed", payload);
     } catch {
@@ -692,6 +888,57 @@ export class DataPlaneManager {
       );
     }
     await sub.ctx.sendChunk(chunk);
+  }
+
+  detachSessionSubscriptions(sessionId: string): void {
+    for (const sub of this.subscriptions.values()) {
+      if (sub.session.sessionId === sessionId) {
+        sub.detached = true;
+      }
+    }
+  }
+
+  async rebindSessionSubscriptions(
+    sessionId: string,
+    newEmit: (method: string, payload: unknown) => Promise<void>,
+    requested?: Array<{ subscriptionId: string; lastSequence?: number }>,
+  ): Promise<ResumedSubscriptionStatus[]> {
+    const results: ResumedSubscriptionStatus[] = [];
+    const byId = new Map<string, ActiveSubscription>();
+    for (const sub of this.subscriptions.values()) {
+      if (sub.session.sessionId === sessionId && !sub.closed) {
+        sub.emit = newEmit;
+        sub.detached = false;
+        sub.ready = true;
+        byId.set(sub.subscriptionId, sub);
+      }
+    }
+
+    const targets: Array<{ subscriptionId: string; lastSequence?: number }> =
+      requested ?? [...byId.keys()].map((subscriptionId) => ({ subscriptionId }));
+    for (const item of targets) {
+      const sub = byId.get(item.subscriptionId);
+      if (!sub) {
+        results.push({ subscriptionId: item.subscriptionId, status: "closed" });
+        continue;
+      }
+      const lastSeq = item.lastSequence ?? sub.sequence;
+      if (lastSeq >= sub.sequence) {
+        results.push({ subscriptionId: item.subscriptionId, status: "resumed" });
+        continue;
+      }
+      const earliest = sub.chunkHistory[0]?.sequence;
+      if (earliest !== undefined && lastSeq + 1 < earliest) {
+        results.push({ subscriptionId: item.subscriptionId, status: "resync_required" });
+        continue;
+      }
+      const missing = sub.chunkHistory.filter((c) => c.sequence > lastSeq);
+      for (const chunk of missing) {
+        await newEmit("channel.chunk", chunk);
+      }
+      results.push({ subscriptionId: item.subscriptionId, status: "resumed" });
+    }
+    return results;
   }
 
   async closeSessionSubscriptions(sessionId: string): Promise<void> {

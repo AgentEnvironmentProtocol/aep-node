@@ -90,7 +90,7 @@ export class MemoryTransport implements Transport {
       this.pendingMessages.push(envelope);
       return;
     }
-    for (const handler of this.messageHandlers) {
+    for (const handler of [...this.messageHandlers]) {
       try {
         handler(envelope);
       } catch (err) {

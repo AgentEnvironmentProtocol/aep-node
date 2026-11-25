@@ -33,11 +33,14 @@ import {
   type ChannelSeekResult,
   type ChannelSendParams,
   type ChannelSendResult,
+  type DataRenderParams,
+  type DataRenderResult,
   type EventDecl,
   type GetBinaryParams,
   type GetBinaryResult,
   type MetaMap,
   type MethodDecl,
+  type NodeInvokeResult,
   type NodeKind,
   type NodeLoadChildrenParams,
   type NodeLoadChildrenResult,
@@ -73,6 +76,14 @@ export interface ServerMountOptions {
   timeoutMs?: number;
   mountKey?: string;
   hopOrigins?: string[];
+  allowElevation?: boolean;
+  stripMetaPrefixes?: string[];
+  authPropagation?: {
+    strategy: "none" | "static" | "token-exchange" | "passthrough";
+    audience?: string;
+    scopes?: string[];
+    tokenEndpoint?: string;
+  };
 }
 
 export interface ServerMountHostCallbacks {
@@ -91,6 +102,8 @@ interface MountedProviderEntry {
   lazy: boolean;
   hydrated: boolean;
   timeoutMs: number;
+  allowElevation: boolean;
+  stripMetaPrefixes?: string[];
   downstreamOrigins: string[];
   vocabularies: string[];
   unsubscribers: Array<() => void>;
@@ -334,7 +347,8 @@ export class ServerMountManager {
       sourcePath === "/" &&
       anchorKind !== "ou" &&
       anchorKind !== "interface" &&
-      anchorKind !== "component"
+      anchorKind !== "component" &&
+      anchorKind !== "api"
     ) {
       throw new AepError(
         AEP_ERROR_CODES.INVALID_MESSAGE,
@@ -379,7 +393,12 @@ export class ServerMountManager {
     if (!existingAnchor) {
       if (sourcePath === "/") {
         const baseKind = options.anchorNode?.kind ?? "ou";
-        if (baseKind !== "ou" && baseKind !== "interface" && baseKind !== "component") {
+        if (
+          baseKind !== "ou" &&
+          baseKind !== "interface" &&
+          baseKind !== "component" &&
+          baseKind !== "api"
+        ) {
           throw new AepError(
             AEP_ERROR_CODES.INVALID_MESSAGE,
             `Unsupported anchor node kind "${String(baseKind)}" at "${options.anchorPath}"`,
@@ -522,6 +541,8 @@ export class ServerMountManager {
       lazy: Boolean(options.lazy),
       hydrated: !options.lazy,
       timeoutMs,
+      allowElevation: Boolean(options.allowElevation),
+      ...(options.stripMetaPrefixes ? { stripMetaPrefixes: [...options.stripMetaPrefixes] } : {}),
       downstreamOrigins: [...combinedOrigins],
       vocabularies,
       unsubscribers: [],
@@ -541,7 +562,13 @@ export class ServerMountManager {
       });
     } else if (initialSubtree && initialSubtree.kind === "body") {
       for (const child of initialSubtree.children) {
-        const rewritten = rewriteNodeForUpstream(child, "/", options.anchorPath, entry.mountKey);
+        const rewritten = rewriteNodeForUpstream(
+          child,
+          "/",
+          options.anchorPath,
+          entry.mountKey,
+          entry.stripMetaPrefixes,
+        );
         await this.host.broadcastNotification("node.added", {
           parentPath: options.anchorPath,
           node: rewritten,
@@ -631,6 +658,7 @@ export class ServerMountManager {
           entry.sourcePath,
           entry.anchorPath,
           entry.mountKey,
+          entry.stripMetaPrefixes,
         );
         void this.host.broadcastNotification("node.added", {
           parentPath,
@@ -654,11 +682,49 @@ export class ServerMountManager {
           entry.sourcePath,
           entry.anchorPath,
           entry.mountKey,
+          entry.stripMetaPrefixes,
         );
         if (ev.path === entry.sourcePath && entry.sourcePath !== "/") {
           node.id = splitParentPath(entry.anchorPath).id;
         }
         void this.host.broadcastNotification("node.updated", { path, node });
+      }),
+    );
+
+    entry.unsubscribers.push(
+      entry.client.onNodeMoved((ev) => {
+        if (!isPathWithin(ev.fromPath, entry.sourcePath) || !isPathWithin(ev.toPath, entry.sourcePath)) {
+          return;
+        }
+        const fromPath = rebasePath(ev.fromPath, entry.sourcePath, entry.anchorPath);
+        const toPath = rebasePath(ev.toPath, entry.sourcePath, entry.anchorPath);
+        if (!fromPath || !toPath) {
+          return;
+        }
+        for (const proxy of this.proxySubscriptions.values()) {
+          if (proxy.mount === entry && proxy.upstreamPath && isPathWithin(proxy.upstreamPath, fromPath)) {
+            const relocated = rebasePath(proxy.upstreamPath, fromPath, toPath);
+            if (relocated) {
+              proxy.upstreamPath = relocated;
+            }
+          }
+        }
+        const rewrittenNode = ev.node
+          ? rewriteNodeForUpstream(
+              ev.node,
+              entry.sourcePath,
+              entry.anchorPath,
+              entry.mountKey,
+              entry.stripMetaPrefixes,
+            )
+          : undefined;
+        void this.host.broadcastNotification("node.moved", {
+          fromPath,
+          toPath,
+          ...(ev.uid !== undefined ? { uid: ev.uid } : {}),
+          ...(rewrittenNode !== undefined ? { node: rewrittenNode } : {}),
+          ...(ev.index !== undefined ? { index: ev.index } : {}),
+        });
       }),
     );
 
@@ -752,7 +818,13 @@ export class ServerMountManager {
         );
       }
       const rewrittenChildren = res.node.children.map((child) =>
-        rewriteNodeForUpstream(child, "/", mount.anchorPath, mount.mountKey),
+        rewriteNodeForUpstream(
+          child,
+          "/",
+          mount.anchorPath,
+          mount.mountKey,
+          mount.stripMetaPrefixes,
+        ),
       );
       return {
         ...(localAnchor as Exclude<AepNode, ChannelNode>),
@@ -779,6 +851,7 @@ export class ServerMountManager {
       mount.sourcePath,
       mount.anchorPath,
       mount.mountKey,
+      mount.stripMetaPrefixes,
     );
     if (upstreamPath === mount.anchorPath && mount.sourcePath !== "/") {
       rewritten.id = splitParentPath(mount.anchorPath).id;
@@ -895,6 +968,7 @@ export class ServerMountManager {
           directMount.sourcePath,
           directMount.anchorPath,
           directMount.mountKey,
+          directMount.stripMetaPrefixes,
         ),
         depth: m.depth,
       }));
@@ -954,6 +1028,7 @@ export class ServerMountManager {
             mount.sourcePath,
             mount.anchorPath,
             mount.mountKey,
+            mount.stripMetaPrefixes,
           );
           if (m.path === mount.sourcePath && mount.sourcePath !== "/") {
             rewritten.id = splitParentPath(mount.anchorPath).id;
@@ -975,7 +1050,7 @@ export class ServerMountManager {
 
   async loadChildren(
     mount: MountedProviderEntry,
-    params: NodeLoadChildrenParams,
+    params: NodeLoadChildrenParams & { path: Path },
   ): Promise<NodeLoadChildrenResult> {
     const downstreamPath = rebasePath(params.path, mount.anchorPath, mount.sourcePath);
     if (!downstreamPath) {
@@ -991,7 +1066,13 @@ export class ServerMountManager {
         throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, "Expected BodyRoot from mounted '/'");
       }
       const rewritten = treeRes.node.children.map((child) =>
-        rewriteNodeForUpstream(child, "/", mount.anchorPath, mount.mountKey),
+        rewriteNodeForUpstream(
+          child,
+          "/",
+          mount.anchorPath,
+          mount.mountKey,
+          mount.stripMetaPrefixes,
+        ),
       );
       let offset = 0;
       if (params.cursor !== undefined) {
@@ -1019,17 +1100,50 @@ export class ServerMountManager {
       mount.client.loadChildren(downstreamPath, {
         ...(params.cursor !== undefined ? { cursor: params.cursor } : {}),
         ...(params.limit !== undefined ? { limit: params.limit } : {}),
+        ...(mount.allowElevation && params.grantId !== undefined
+          ? { grantId: params.grantId }
+          : {}),
       }),
     );
     mount.hydrated = true;
     return {
-      path: params.path,
+      path: params.path!,
       children: res.children.map((child) =>
-        rewriteNodeForUpstream(child, mount.sourcePath, mount.anchorPath, mount.mountKey),
+        rewriteNodeForUpstream(
+          child,
+          mount.sourcePath,
+          mount.anchorPath,
+          mount.mountKey,
+          mount.stripMetaPrefixes,
+        ),
       ),
       ...(res.hasMore !== undefined ? { hasMore: res.hasMore } : {}),
       ...(res.nextCursor !== undefined ? { nextCursor: res.nextCursor } : {}),
     };
+  }
+
+  private mapMountElevationError(mount: MountedProviderEntry, err: unknown): never {
+    if (err instanceof AepError && err.code === AEP_ERROR_CODES.ELEVATION_REQUIRED) {
+      if (!mount.allowElevation) {
+        throw new AepError(
+          AEP_ERROR_CODES.ELEVATION_DENIED,
+          `Elevation required by mounted provider at "${mount.anchorPath}" cannot cross mount boundary (allowElevation is false)`,
+        );
+      }
+      if (err.data && typeof err.data === "object" && !Array.isArray(err.data)) {
+        const d = { ...(err.data as Record<string, unknown>) };
+        if (typeof d["targetPath"] === "string") {
+          const rebased = rebasePath(d["targetPath"], mount.sourcePath, mount.anchorPath);
+          if (rebased) d["targetPath"] = rebased;
+        }
+        if (typeof d["approvalEndpointPath"] === "string") {
+          const rebased = rebasePath(d["approvalEndpointPath"], mount.sourcePath, mount.anchorPath);
+          if (rebased) d["approvalEndpointPath"] = rebased;
+        }
+        throw new AepError(AEP_ERROR_CODES.ELEVATION_REQUIRED, err.message, d);
+      }
+    }
+    throw err;
   }
 
   async invokeMounted(
@@ -1038,7 +1152,12 @@ export class ServerMountManager {
     method: string,
     params: unknown,
     session: ServerSessionContext,
-  ): Promise<unknown> {
+    options?: {
+      expectedRevision?: number;
+      leaseId?: string;
+      grantId?: string;
+    },
+  ): Promise<NodeInvokeResult> {
     const downstreamPath = rebasePath(path, mount.anchorPath, mount.sourcePath);
     if (!downstreamPath) {
       throw new AepError(AEP_ERROR_CODES.INVALID_PATH, `Path "${path}" outside mount`);
@@ -1065,10 +1184,77 @@ export class ServerMountManager {
       }
     }
 
-    const res = await withMountTimeout(mount, () =>
-      mount.client.invoke(downstreamPath, method, params),
-    );
-    return rewriteValueRefsForUpstream(res.result, mount.mountKey);
+    try {
+      const res = await withMountTimeout(mount, () =>
+        mount.client.invoke(downstreamPath, method, params, {
+          ...(options?.expectedRevision !== undefined
+            ? { expectedRevision: options.expectedRevision }
+            : {}),
+          ...(mount.allowElevation && options?.grantId !== undefined
+            ? { grantId: options.grantId }
+            : {}),
+        }),
+      );
+      return {
+        path,
+        method,
+        ...(res.revision !== undefined ? { revision: res.revision } : {}),
+        result: rewriteValueRefsForUpstream(res.result, mount.mountKey),
+      };
+    } catch (err) {
+      return this.mapMountElevationError(mount, err);
+    }
+  }
+
+  async renderMounted(
+    mount: MountedProviderEntry,
+    path: Path,
+    params: DataRenderParams,
+  ): Promise<DataRenderResult> {
+    const downstreamPath = rebasePath(path, mount.anchorPath, mount.sourcePath);
+    if (!downstreamPath) {
+      throw new AepError(AEP_ERROR_CODES.INVALID_PATH, `Path "${path}" outside mount`);
+    }
+    try {
+      const res = await withMountTimeout(mount, () =>
+        mount.client.render({
+          path: downstreamPath,
+          mode: params.mode,
+          ...(mount.allowElevation && params.grantId !== undefined
+            ? { grantId: params.grantId }
+            : {}),
+          ...(params.params !== undefined ? { params: params.params } : {}),
+        }),
+      );
+      let rebasedMap: Record<string, Path> | undefined;
+      if (res.pathMap) {
+        rebasedMap = {};
+        for (const [k, v] of Object.entries(res.pathMap)) {
+          rebasedMap[k] = rebasePath(v, mount.sourcePath, mount.anchorPath) ?? v;
+        }
+      }
+      return {
+        ...res,
+        path,
+        ...(res.resolvedPath !== undefined
+          ? {
+              resolvedPath:
+                rebasePath(res.resolvedPath, mount.sourcePath, mount.anchorPath) ?? path,
+            }
+          : {}),
+        ...(res.reference !== undefined
+          ? {
+              reference: {
+                ...res.reference,
+                refId: toUpstreamRefId(mount.mountKey, res.reference.refId),
+              },
+            }
+          : {}),
+        ...(rebasedMap !== undefined ? { pathMap: rebasedMap } : {}),
+      };
+    } catch (err) {
+      return this.mapMountElevationError(mount, err);
+    }
   }
 
   canHandleBinaryRef(refId: string): boolean {
@@ -1171,13 +1357,21 @@ export class ServerMountManager {
       }
     }
 
-    const downstreamSub = await withMountTimeout(mount, () =>
-      mount.client.openChannel({
-        ...(downstreamPath !== undefined ? { path: downstreamPath } : {}),
-        ...(downstreamRefId !== undefined ? { refId: downstreamRefId } : {}),
-        ...(params.params !== undefined ? { params: params.params } : {}),
-      }),
-    );
+    let downstreamSub: ClientChannelSubscription;
+    try {
+      downstreamSub = await withMountTimeout(mount, () =>
+        mount.client.openChannel({
+          ...(downstreamPath !== undefined ? { path: downstreamPath } : {}),
+          ...(downstreamRefId !== undefined ? { refId: downstreamRefId } : {}),
+          ...(mount.allowElevation && params.grantId !== undefined
+            ? { grantId: params.grantId }
+            : {}),
+          ...(params.params !== undefined ? { params: params.params } : {}),
+        }),
+      );
+    } catch (err) {
+      return this.mapMountElevationError(mount, err);
+    }
 
     if (
       session.role === "observer" &&
@@ -1225,7 +1419,8 @@ export class ServerMountManager {
           timestamp: chunk.timestamp,
           mediaType: chunk.mediaType,
           ...(chunk.offset !== undefined ? { offset: chunk.offset } : {}),
-          data: chunk.data,
+          ...(chunk.data !== undefined ? { data: chunk.data } : {}),
+          ...(chunk.event !== undefined ? { event: chunk.event } : {}),
           ...(chunk.isFinal !== undefined ? { isFinal: chunk.isFinal } : {}),
         };
         if (!proxy.ready) {
@@ -1246,17 +1441,26 @@ export class ServerMountManager {
 
     return {
       subscriptionId: proxySubscriptionId,
-      ...(upstreamPath !== undefined ? { path: upstreamPath } : {}),
+      ...(upstreamPath !== undefined ? { path: upstreamPath, resolvedPath: upstreamPath } : {}),
       reference: {
         ...downstreamSub.reference,
         refId: toUpstreamRefId(mount.mountKey, downstreamSub.reference.refId),
       },
       direction: downstreamSub.direction,
+      payloadMode: downstreamSub.payloadMode,
     };
   }
 
   hasProxySubscription(subscriptionId: string): boolean {
     return this.proxySubscriptions.has(subscriptionId);
+  }
+
+  getProxySubscription(subscriptionId: string): { path?: Path; sessionId: string } | undefined {
+    const proxy = this.proxySubscriptions.get(subscriptionId);
+    if (!proxy || proxy.closed) {
+      return undefined;
+    }
+    return { path: proxy.upstreamPath, sessionId: proxy.upstreamSessionId };
   }
 
   async sendChannel(
@@ -1282,8 +1486,30 @@ export class ServerMountManager {
         "Cannot call channel.send on sense-only mounted channel",
       );
     }
+    if (proxy.downstreamSub.payloadMode === "event") {
+      if (!params.event || params.data !== undefined) {
+        throw new AepError(
+          AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+          "Event channel requires event and MUST NOT include data",
+        );
+      }
+      return await withMountTimeout(proxy.mount, () =>
+        proxy.downstreamSub.sendEvent(params.event!, {
+          ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
+          ...(params.timestamp !== undefined ? { timestamp: params.timestamp } : {}),
+          ...(params.mediaType !== undefined ? { mediaType: params.mediaType } : {}),
+          ...(params.isFinal !== undefined ? { isFinal: params.isFinal } : {}),
+        }),
+      );
+    }
+    if (!(params.data instanceof Uint8Array) || params.event !== undefined) {
+      throw new AepError(
+        AEP_ERROR_CODES.PAYLOAD_MODE_MISMATCH,
+        "Binary channel requires data and MUST NOT include event",
+      );
+    }
     return await withMountTimeout(proxy.mount, () =>
-      proxy.downstreamSub.send(params.data, {
+      proxy.downstreamSub.send(params.data!, {
         ...(params.sequence !== undefined ? { sequence: params.sequence } : {}),
         ...(params.timestamp !== undefined ? { timestamp: params.timestamp } : {}),
         ...(params.mediaType !== undefined ? { mediaType: params.mediaType } : {}),
@@ -1316,22 +1542,36 @@ export class ServerMountManager {
     target: { mount: MountedProviderEntry; downstreamPath?: Path; downstreamRefId?: string },
     params: ChannelSampleParams,
   ): Promise<ChannelSampleResult> {
-    const res = await withMountTimeout(target.mount, () =>
-      target.mount.client.sampleChannel({
-        ...(target.downstreamPath !== undefined ? { path: target.downstreamPath } : {}),
-        ...(target.downstreamRefId !== undefined ? { refId: target.downstreamRefId } : {}),
-        offset: params.offset,
-        ...(params.unit !== undefined ? { unit: params.unit } : {}),
-        ...(params.params !== undefined ? { params: params.params } : {}),
-      }),
-    );
-    return {
-      ...res,
-      reference: {
-        ...res.reference,
-        refId: toUpstreamRefId(target.mount.mountKey, res.reference.refId),
-      },
-    };
+    try {
+      const res = await withMountTimeout(target.mount, () =>
+        target.mount.client.sampleChannel({
+          ...(target.downstreamPath !== undefined ? { path: target.downstreamPath } : {}),
+          ...(target.downstreamRefId !== undefined ? { refId: target.downstreamRefId } : {}),
+          offset: params.offset,
+          ...(params.unit !== undefined ? { unit: params.unit } : {}),
+          ...(target.mount.allowElevation && params.grantId !== undefined
+            ? { grantId: params.grantId }
+            : {}),
+          ...(params.params !== undefined ? { params: params.params } : {}),
+        }),
+      );
+      return {
+        ...res,
+        ...(res.resolvedPath !== undefined
+          ? {
+              resolvedPath:
+                rebasePath(res.resolvedPath, target.mount.sourcePath, target.mount.anchorPath) ??
+                res.resolvedPath,
+            }
+          : {}),
+        reference: {
+          ...res.reference,
+          refId: toUpstreamRefId(target.mount.mountKey, res.reference.refId),
+        },
+      };
+    } catch (err) {
+      return this.mapMountElevationError(target.mount, err);
+    }
   }
 
   async closeChannel(subscriptionId: string, sessionId: string): Promise<ChannelCloseResult> {

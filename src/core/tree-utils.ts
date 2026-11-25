@@ -57,8 +57,14 @@ export function cloneNode<T extends AepNode>(node: T, maxDepth?: number): T {
     kind: node.kind,
   };
 
+  if (node.uid !== undefined) {
+    copy["uid"] = node.uid;
+  }
   if (node.type !== undefined) {
     copy["type"] = node.type;
+  }
+  if (node.revision !== undefined) {
+    copy["revision"] = node.revision;
   }
   if (node.properties !== undefined) {
     copy["properties"] = structuredClone(node.properties);
@@ -80,6 +86,12 @@ export function cloneNode<T extends AepNode>(node: T, maxDepth?: number): T {
     copy["mediaType"] = node.mediaType;
     copy["direction"] = node.direction;
     copy["deliveryMode"] = node.deliveryMode;
+    if (node.payloadMode !== undefined) {
+      copy["payloadMode"] = node.payloadMode;
+    }
+    if (node.eventSchema !== undefined) {
+      copy["eventSchema"] = structuredClone(node.eventSchema);
+    }
     if (node.streamRef !== undefined) {
       copy["streamRef"] = structuredClone(node.streamRef);
     }
@@ -142,6 +154,32 @@ export function findNodeInChildren(children: readonly BodyChild[], path: Path): 
     }
   }
   return current;
+}
+
+export function findNodeByUidInChildren(
+  children: readonly BodyChild[],
+  uid: string,
+  basePath: Path = "/",
+): { path: Path; node: AepNode } | undefined {
+  const walk = (
+    nodes: readonly AepNode[],
+    parentPath: Path,
+  ): { path: Path; node: AepNode } | undefined => {
+    for (const node of nodes) {
+      const nodePath = parentPath === "/" ? `/${node.id}` : `${parentPath}/${node.id}`;
+      if (node.uid === uid) {
+        return { path: nodePath, node };
+      }
+      if (node.kind !== "channel" && node.children) {
+        const found = walk(node.children, nodePath);
+        if (found) {
+          return found;
+        }
+      }
+    }
+    return undefined;
+  };
+  return walk(children, basePath);
 }
 
 function matchesTypeTag(nodeType: string | undefined, patterns: readonly string[]): boolean {
@@ -222,6 +260,9 @@ function matchesKeyValueFilters(
 }
 
 export function matchesQueryPredicates(node: AepNode, params: TreeQueryParams): boolean {
+  if (params.uids && (!node.uid || !params.uids.includes(node.uid))) {
+    return false;
+  }
   if (params.kinds && !params.kinds.includes(node.kind)) {
     return false;
   }
@@ -244,6 +285,11 @@ export function matchesQueryPredicates(node: AepNode, params: TreeQueryParams): 
   }
   if (params.direction !== undefined) {
     if (node.kind !== "channel" || node.direction !== params.direction) {
+      return false;
+    }
+  }
+  if (params.payloadMode !== undefined) {
+    if (node.kind !== "channel" || (node.payloadMode ?? "binary") !== params.payloadMode) {
       return false;
     }
   }

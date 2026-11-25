@@ -139,8 +139,8 @@ describe("Sessions, Roles, and Concurrency Policies", () => {
     const obsCam = await obs.openChannel({ path: "/robot/left-eye" });
     const ctrlFrames: number[][] = [];
     const obsFrames: number[][] = [];
-    ctrlCam.onChunk((c) => ctrlFrames.push([...c.data]));
-    obsCam.onChunk((c) => obsFrames.push([...c.data]));
+    ctrlCam.onChunk((c) => ctrlFrames.push([...c.data!]));
+    obsCam.onChunk((c) => obsFrames.push([...c.data!]));
 
     await server.publishChannelChunk("/robot/left-eye", { data: new Uint8Array([0xaa, 0xbb]) });
     await new Promise((r) => setTimeout(r, 15));

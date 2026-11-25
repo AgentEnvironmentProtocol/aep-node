@@ -85,8 +85,20 @@ export function rewriteNodeForUpstream<T extends AepNode>(
   sourceRoot: Path,
   anchorPath: Path,
   mountKey: string,
+  stripMetaPrefixes?: readonly string[],
 ): T {
   const cloned = structuredClone(node);
+
+  if (cloned.meta && stripMetaPrefixes && stripMetaPrefixes.length > 0) {
+    for (const key of Object.keys(cloned.meta)) {
+      if (stripMetaPrefixes.some((prefix) => key.startsWith(prefix))) {
+        delete cloned.meta[key];
+      }
+    }
+    if (Object.keys(cloned.meta).length === 0) {
+      delete cloned.meta;
+    }
+  }
 
   if (cloned.properties) {
     cloned.properties = rewriteCaptureProperty(cloned.properties, mountKey);
@@ -121,7 +133,7 @@ export function rewriteNodeForUpstream<T extends AepNode>(
 
   if (cloned.children) {
     cloned.children = cloned.children.map((child) =>
-      rewriteNodeForUpstream(child, sourceRoot, anchorPath, mountKey),
+      rewriteNodeForUpstream(child, sourceRoot, anchorPath, mountKey, stripMetaPrefixes),
     ) as typeof cloned.children;
   }
 
