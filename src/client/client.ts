@@ -66,12 +66,21 @@ import {
   type TreeQueryParams,
   type TreeQueryResult,
 } from "../core/types.js";
+import {
+  areVersionsSemverCompatible,
+  buildSupportedVersionList,
+  negotiateProtocolVersion,
+  type ProtocolVersionAdapter,
+} from "../core/version.js";
 import type { Transport } from "../transport/types.js";
 import { ClientChannelSubscription } from "./subscription.js";
 
 export interface AepClientOptions {
   clientInfo?: ClientInfo;
   supportedVersions?: string[];
+  versionAdapters?: ProtocolVersionAdapter[];
+  allowCompatibleMinorVersions?: boolean;
+  adaptOnUnsupportedVersion?: boolean;
   capabilities?: "aep-core-static" | "aep-core-streaming" | Partial<CapabilitiesObject>;
   security?: SecurityDescriptor;
   session?: {
@@ -91,7 +100,7 @@ interface PendingRequest {
 
 const DEFAULT_CLIENT_INFO: ClientInfo = {
   name: "aep-node-client",
-  version: "0.1.0",
+  version: "1.0.0-beta.0",
 };
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -101,14 +110,20 @@ export class AepClient {
   private readonly options: AepClientOptions;
   private readonly requestTimeoutMs: number;
   private readonly syncTree: boolean;
+  private readonly configuredSupportedVersions: string[];
+  private readonly versionAdapters: ProtocolVersionAdapter[];
+  private readonly allowCompatibleMinorVersions: boolean;
+  private readonly adaptOnUnsupportedVersion: boolean;
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly subscriptions = new Map<string, ClientChannelSubscription>();
   private readonly unsubscribers: Array<() => void> = [];
 
   private nextRequestSeq = 1;
   private initialized = false;
+  private versionNegotiated = false;
   private closed = false;
   private currentProtocolVersion = AEP_PROTOCOL_VERSION;
+  private activeAdapter?: ProtocolVersionAdapter;
   private currentServerInfo?: ServerInfo;
   private currentHead: MetaMap = {};
   private currentCapabilities?: CapabilitiesObject;
@@ -140,6 +155,14 @@ export class AepClient {
     this.options = options;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.syncTree = Boolean(options.syncTree);
+    this.versionAdapters = options.versionAdapters ? [...options.versionAdapters] : [];
+    this.allowCompatibleMinorVersions = options.allowCompatibleMinorVersions ?? true;
+    this.adaptOnUnsupportedVersion = options.adaptOnUnsupportedVersion ?? true;
+    this.configuredSupportedVersions = buildSupportedVersionList(
+      options.supportedVersions,
+      this.versionAdapters,
+    );
+    this.currentProtocolVersion = this.configuredSupportedVersions[0] ?? AEP_PROTOCOL_VERSION;
 
     this.attachTransportListeners(transport);
   }
@@ -186,6 +209,14 @@ export class AepClient {
 
   get protocolVersion(): string {
     return this.currentProtocolVersion;
+  }
+
+  get supportedVersions(): string[] {
+    return [...this.configuredSupportedVersions];
+  }
+
+  get activeVersionAdapter(): ProtocolVersionAdapter | undefined {
+    return this.activeAdapter;
   }
 
   get serverInfo(): ServerInfo | undefined {
@@ -254,10 +285,20 @@ export class AepClient {
         ? buildCapabilities(this.options.capabilities)
         : buildCapabilities("aep-core-streaming"));
 
+    const hasOverrideVersions =
+      Array.isArray(overrides?.supportedVersions) && overrides.supportedVersions.length > 0;
+    const offeredVersions = hasOverrideVersions
+      ? [...overrides!.supportedVersions!]
+      : [...this.configuredSupportedVersions];
+    const effectiveAdapters = hasOverrideVersions ? undefined : this.versionAdapters;
+
+    this.currentProtocolVersion = offeredVersions[0] ?? AEP_PROTOCOL_VERSION;
+    this.activeAdapter = undefined;
+    this.versionNegotiated = false;
+
     const params: SessionInitializeParams = {
       clientInfo: overrides?.clientInfo ?? this.options.clientInfo ?? { ...DEFAULT_CLIENT_INFO },
-      supportedVersions: overrides?.supportedVersions ??
-        this.options.supportedVersions ?? [AEP_PROTOCOL_VERSION],
+      supportedVersions: offeredVersions,
       capabilities: requestedCaps,
       ...(overrides?.security !== undefined
         ? { security: overrides.security }
@@ -271,12 +312,60 @@ export class AepClient {
           : {}),
     };
 
-    const result = (await this.sendRequest(
-      "session.initialize",
-      params,
-    )) as SessionInitializeResult;
+    let result: SessionInitializeResult;
+    try {
+      result = (await this.sendRequest("session.initialize", params)) as SessionInitializeResult;
+    } catch (err) {
+      if (
+        err instanceof AepError &&
+        err.code === AEP_ERROR_CODES.UNSUPPORTED_VERSION &&
+        this.adaptOnUnsupportedVersion &&
+        err.data &&
+        typeof err.data === "object" &&
+        !Array.isArray(err.data)
+      ) {
+        const rawServerVersions = (err.data as Record<string, unknown>)["supportedVersions"];
+        const serverVersions = Array.isArray(rawServerVersions)
+          ? rawServerVersions.filter((v): v is string => typeof v === "string" && v.length > 0)
+          : [];
+        const fallback = negotiateProtocolVersion(serverVersions, {
+          supportedVersions: offeredVersions,
+          adapters: effectiveAdapters,
+          allowCompatibleMinor: this.allowCompatibleMinorVersions,
+        });
+        if (fallback && !offeredVersions.includes(fallback.selectedVersion)) {
+          this.currentProtocolVersion = fallback.selectedVersion;
+          result = (await this.sendRequest("session.initialize", {
+            ...params,
+            supportedVersions: [fallback.selectedVersion],
+          })) as SessionInitializeResult;
+        } else {
+          throw err;
+        }
+      } else {
+        throw err;
+      }
+    }
 
-    this.currentProtocolVersion = result.protocolVersion;
+    const serverSelected = result.protocolVersion;
+    const isAcceptable =
+      offeredVersions.includes(serverSelected) ||
+      (this.allowCompatibleMinorVersions &&
+        offeredVersions.some((v) => areVersionsSemverCompatible(v, serverSelected)));
+    if (!isAcceptable) {
+      throw new AepError(
+        AEP_ERROR_CODES.UNSUPPORTED_VERSION,
+        `Server selected unsupported protocolVersion "${serverSelected}"`,
+        {
+          supportedVersions: offeredVersions,
+          actualVersion: serverSelected,
+        },
+      );
+    }
+
+    this.currentProtocolVersion = serverSelected;
+    this.activeAdapter = effectiveAdapters?.find((a) => a.version === serverSelected);
+    this.versionNegotiated = true;
     this.currentServerInfo = result.serverInfo;
     this.currentSecurity = result.security;
 
@@ -689,13 +778,16 @@ export class AepClient {
     }
 
     const id = `req-${this.nextRequestSeq++}`;
-    const envelope: ControlEnvelope = {
+    let envelope: ControlEnvelope = {
       protocolVersion: this.currentProtocolVersion,
       kind: "request",
       id,
       method,
       ...(params !== undefined ? { params } : {}),
     };
+    if (this.activeAdapter?.encodeEnvelope && method !== "session.initialize") {
+      envelope = this.activeAdapter.encodeEnvelope(envelope);
+    }
 
     return await new Promise<unknown>((resolve, reject) => {
       const timer =
@@ -727,31 +819,63 @@ export class AepClient {
   }
 
   private handleEnvelope(envelope: ControlEnvelope): void {
-    if (envelope.kind === "response") {
-      const pending = this.pendingRequests.get(envelope.id);
-      if (!pending) {
-        return;
-      }
-      this.pendingRequests.delete(envelope.id);
-      if (pending.timer) {
-        clearTimeout(pending.timer);
-      }
-      if (envelope.ok) {
-        try {
-          pending.onResult?.(envelope.result);
-        } catch (err) {
-          pending.reject(err);
-          return;
+    if (this.versionNegotiated && envelope.protocolVersion !== this.currentProtocolVersion) {
+      const mismatchErr = new AepError(
+        AEP_ERROR_CODES.UNSUPPORTED_VERSION,
+        `Inbound envelope protocolVersion "${envelope.protocolVersion}" does not match session protocolVersion "${this.currentProtocolVersion}"`,
+        {
+          expectedVersion: this.currentProtocolVersion,
+          actualVersion: envelope.protocolVersion,
+          supportedVersions: [...this.configuredSupportedVersions],
+        },
+      );
+      if (envelope.kind === "response") {
+        const pending = this.pendingRequests.get(envelope.id);
+        if (pending) {
+          this.pendingRequests.delete(envelope.id);
+          if (pending.timer) {
+            clearTimeout(pending.timer);
+          }
+          pending.reject(mismatchErr);
         }
-        pending.resolve(envelope.result);
       } else {
-        pending.reject(AepError.from(envelope.error));
+        for (const handler of this.errorHandlers) {
+          handler(mismatchErr);
+        }
       }
       return;
     }
 
-    if (envelope.kind === "notification") {
-      this.handleNotification(envelope);
+    const decoded =
+      this.versionNegotiated && this.activeAdapter?.decodeEnvelope
+        ? this.activeAdapter.decodeEnvelope(envelope)
+        : envelope;
+
+    if (decoded.kind === "response") {
+      const pending = this.pendingRequests.get(decoded.id);
+      if (!pending) {
+        return;
+      }
+      this.pendingRequests.delete(decoded.id);
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
+      if (decoded.ok) {
+        try {
+          pending.onResult?.(decoded.result);
+        } catch (err) {
+          pending.reject(err);
+          return;
+        }
+        pending.resolve(decoded.result);
+      } else {
+        pending.reject(AepError.from(decoded.error));
+      }
+      return;
+    }
+
+    if (decoded.kind === "notification") {
+      this.handleNotification(decoded);
     }
   }
 

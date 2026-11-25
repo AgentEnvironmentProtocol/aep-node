@@ -236,7 +236,7 @@ describe("Api/Endpoint Grammar, Multi-Tier Rendering, and Configuration Manifest
     const jsonCodec = new JsonTextCodec();
     const binCodec = new BinaryEnvelopeCodec();
     const pngEnvelope = {
-      protocolVersion: "1.0.0-draft",
+      protocolVersion: "1.0.0-beta.0",
       kind: "response" as const,
       id: "r1",
       ok: true as const,

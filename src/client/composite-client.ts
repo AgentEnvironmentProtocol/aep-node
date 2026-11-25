@@ -225,9 +225,11 @@ export class AepCompositeClient {
   getHead(): MetaMap {
     const profiles = new Set<string>();
     const vocabularies = new Set<string>();
+    const versions = new Set<string>();
     const mountsInfo: Record<string, unknown> = {};
 
     for (const entry of this.mountsByAnchor.values()) {
+      versions.add(entry.client.protocolVersion);
       const head = entry.client.head;
       const pList = head[HEAD_KEYS.PROFILES];
       if (Array.isArray(pList)) {
@@ -247,13 +249,16 @@ export class AepCompositeClient {
       }
       mountsInfo[entry.mountKey] = {
         anchorPath: entry.anchorPath,
+        protocolVersion: entry.client.protocolVersion,
         ...(entry.client.serverInfo ? { serverInfo: entry.client.serverInfo } : {}),
         connected: !entry.client.isClosed,
       };
     }
 
+    const negotiatedVersion = versions.size === 1 ? [...versions][0]! : AEP_PROTOCOL_VERSION;
+
     return {
-      [HEAD_KEYS.PROTOCOL_VERSION]: AEP_PROTOCOL_VERSION,
+      [HEAD_KEYS.PROTOCOL_VERSION]: negotiatedVersion,
       [HEAD_KEYS.PROFILES]: [...profiles],
       ...(vocabularies.size > 0 ? { [HEAD_KEYS.VOCABULARIES]: [...vocabularies] } : {}),
       "aep.compositeMounts": mountsInfo as MetaMap[string],

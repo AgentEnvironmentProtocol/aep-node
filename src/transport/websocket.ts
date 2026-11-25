@@ -3,7 +3,7 @@ import http from "node:http";
 import type { IncomingMessage } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { AEP_ERROR_CODES, AepError } from "../core/errors.js";
-import type { AepValue, ControlEnvelope } from "../core/types.js";
+import { AEP_WEBSOCKET_SUBPROTOCOL, type AepValue, type ControlEnvelope } from "../core/types.js";
 import { BinaryEnvelopeCodec, JsonTextCodec } from "./codec.js";
 import type { Codec, Transport, TransportServer } from "./types.js";
 
@@ -14,6 +14,7 @@ export type WebSocketTransportMode = "binary" | "json";
 
 export interface WebSocketLike {
   readonly readyState: number;
+  readonly protocol?: string;
   binaryType?: string;
   send(data: string | Uint8Array<ArrayBuffer> | ArrayBuffer): void;
   close(code?: number, reason?: string): void;
@@ -23,6 +24,7 @@ export interface WebSocketLike {
 
 export interface WebSocketTransportOptions {
   mode?: WebSocketTransportMode;
+  protocol?: string;
   binaryCodec?: Codec;
   jsonCodec?: Codec;
   peerIdentity?: Record<string, AepValue>;
@@ -44,11 +46,13 @@ export class WebSocketTransport implements Transport {
   private closed = false;
   private asyncChain: Promise<void> = Promise.resolve();
   private hasPendingAsync = false;
+  readonly protocol?: string;
   readonly peerIdentity?: Record<string, AepValue>;
 
   constructor(socket: WebSocketLike, options?: WebSocketTransportOptions) {
     this.socket = socket;
     this.mode = options?.mode ?? "binary";
+    this.protocol = options?.protocol ?? (socket.protocol ? socket.protocol : undefined);
     this.binaryCodec = options?.binaryCodec ?? new BinaryEnvelopeCodec();
     this.jsonCodec = options?.jsonCodec ?? new JsonTextCodec();
     if (options?.peerIdentity) {
@@ -253,10 +257,13 @@ export function connectWebSocket(
       reject(new Error("Global WebSocket constructor is not available in this runtime"));
       return;
     }
-    const ws =
-      options?.protocols !== undefined
-        ? new WebSocketCtor(url, options.protocols)
-        : new WebSocketCtor(url);
+    const protocols =
+      options?.protocols === undefined ? [AEP_WEBSOCKET_SUBPROTOCOL] : options.protocols;
+    const hasProtocols =
+      typeof protocols === "string" ? protocols.length > 0 : protocols.length > 0;
+    const ws = hasProtocols
+      ? new WebSocketCtor(url, protocols as string | string[])
+      : new WebSocketCtor(url);
     ws.binaryType = "arraybuffer";
 
     let settled = false;
@@ -271,7 +278,17 @@ export function connectWebSocket(
       }
       settled = true;
       cleanup();
-      resolve(new WebSocketTransport(ws, options));
+      const negotiatedProto =
+        typeof (ws as { protocol?: unknown }).protocol === "string" &&
+        (ws as { protocol: string }).protocol.length > 0
+          ? (ws as { protocol: string }).protocol
+          : undefined;
+      resolve(
+        new WebSocketTransport(ws, {
+          ...options,
+          ...(negotiatedProto !== undefined ? { protocol: negotiatedProto } : {}),
+        }),
+      );
     };
     const onError = () => {
       if (settled) {
@@ -578,6 +595,8 @@ export interface WebSocketTransportServerOptions extends WebSocketTransportOptio
   path?: string;
   maxFrameBytes?: number;
   server?: http.Server;
+  subprotocols?: string[];
+  requireSubprotocol?: boolean;
   verifyClient?: (
     req: IncomingMessage,
   ) => Record<string, AepValue> | null | Promise<Record<string, AepValue> | null>;
@@ -711,6 +730,30 @@ export class WebSocketTransportServer implements TransportServer {
       return;
     }
 
+    const allowedSubprotocols = this.options.subprotocols ?? [AEP_WEBSOCKET_SUBPROTOCOL];
+    const rawProtoHeader = req.headers["sec-websocket-protocol"];
+    const offeredSubprotocols: string[] =
+      typeof rawProtoHeader === "string"
+        ? rawProtoHeader
+            .split(",")
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0)
+        : [];
+
+    let selectedSubprotocol: string | undefined;
+    if (offeredSubprotocols.length > 0) {
+      selectedSubprotocol = offeredSubprotocols.find((p) => allowedSubprotocols.includes(p));
+      if (!selectedSubprotocol) {
+        socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+    } else if (this.options.requireSubprotocol) {
+      socket.write("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+
     let verifiedIdentity: Record<string, AepValue> | undefined = this.options.peerIdentity
       ? structuredClone(this.options.peerIdentity)
       : undefined;
@@ -737,13 +780,17 @@ export class WebSocketTransportServer implements TransportServer {
     }
 
     const acceptKey = createHash("sha1").update(`${wsKey}${WS_GUID}`).digest("base64");
+    const subprotocolLine = selectedSubprotocol
+      ? `Sec-WebSocket-Protocol: ${selectedSubprotocol}\r\n`
+      : "";
     socket.write(
-      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n\r\n`,
+      `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${acceptKey}\r\n${subprotocolLine}\r\n`,
     );
 
     const serverSocket = new Rfc6455ServerSocket(socket, head, this.maxFrameBytes);
     const transport = new WebSocketTransport(serverSocket, {
       mode: this.options.mode,
+      ...(selectedSubprotocol !== undefined ? { protocol: selectedSubprotocol } : {}),
       binaryCodec: this.options.binaryCodec,
       jsonCodec: this.options.jsonCodec,
       peerIdentity: verifiedIdentity,

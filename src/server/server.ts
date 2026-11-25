@@ -62,6 +62,11 @@ import {
   type TreeQueryParams,
 } from "../core/types.js";
 import { validateNode, validateNodeCapabilities } from "../core/validation.js";
+import {
+  buildSupportedVersionList,
+  negotiateProtocolVersion,
+  type ProtocolVersionAdapter,
+} from "../core/version.js";
 import type { Transport, TransportServer } from "../transport/types.js";
 import {
   DataPlaneManager,
@@ -181,6 +186,8 @@ export interface AepServerSecurityOptions {
 export interface AepServerOptions {
   serverInfo?: ServerInfo;
   protocolVersions?: string[];
+  versionAdapters?: ProtocolVersionAdapter[];
+  allowCompatibleMinorVersions?: boolean;
   capabilities?: "aep-core-static" | "aep-core-streaming" | Partial<CapabilitiesObject>;
   head?: MetaMap;
   body?: BodyChild[];
@@ -191,6 +198,7 @@ export interface AepServerOptions {
 export interface ServerSessionHandle {
   readonly sessionId: string;
   readonly initialized: boolean;
+  readonly protocolVersion?: string;
   readonly role?: SessionRole;
   readonly capabilities?: CapabilitiesObject;
   close(reason?: string): Promise<void>;
@@ -239,6 +247,7 @@ interface InternalSession {
   disconnectedAt?: number;
   explicitlyClosed: boolean;
   protocolVersion: string;
+  versionAdapter?: ProtocolVersionAdapter;
   role: SessionRole;
   policy: SessionPolicy;
   capabilities: CapabilitiesObject;
@@ -256,7 +265,7 @@ interface InternalSession {
 
 const DEFAULT_SERVER_INFO: ServerInfo = {
   name: "aep-node-server",
-  version: "0.1.0",
+  version: "1.0.0-beta.0",
 };
 
 const ELEVATION_RANK: Record<ElevationLevel, number> = {
@@ -274,6 +283,8 @@ export class AepServer {
   readonly originId: string;
   private readonly serverInfo: ServerInfo;
   private readonly supportedVersions: string[];
+  private readonly versionAdapters: ProtocolVersionAdapter[];
+  private readonly allowCompatibleMinorVersions: boolean;
   private readonly serverCapabilities: CapabilitiesObject;
   private readonly securityOptions?: AepServerSecurityOptions;
   private readonly treeStore: TreeStore;
@@ -294,9 +305,12 @@ export class AepServer {
   constructor(options: AepServerOptions = {}) {
     this.originId = options.originId ?? `srv-${randomUUID()}`;
     this.serverInfo = options.serverInfo ?? { ...DEFAULT_SERVER_INFO };
-    this.supportedVersions = options.protocolVersions
-      ? [...options.protocolVersions]
-      : [AEP_PROTOCOL_VERSION];
+    this.versionAdapters = options.versionAdapters ? [...options.versionAdapters] : [];
+    this.allowCompatibleMinorVersions = options.allowCompatibleMinorVersions ?? true;
+    this.supportedVersions = buildSupportedVersionList(
+      options.protocolVersions,
+      this.versionAdapters,
+    );
     this.serverCapabilities = buildCapabilities(options.capabilities);
     this.securityOptions = options.security;
 
@@ -322,6 +336,10 @@ export class AepServer {
       broadcastNotification: (method, params) => this.broadcastNotification(method, params),
       onMountHeadsChanged: () => this.syncMountHeadMetadata(),
     });
+  }
+
+  get protocolVersions(): string[] {
+    return [...this.supportedVersions];
   }
 
   get capabilities(): CapabilitiesObject {
@@ -376,6 +394,9 @@ export class AepServer {
       sessionId,
       get initialized() {
         return session.initialized;
+      },
+      get protocolVersion() {
+        return session.initialized || session.pendingAuth ? session.protocolVersion : undefined;
       },
       get role() {
         return session.initialized ? session.role : undefined;
@@ -743,9 +764,18 @@ export class AepServer {
     };
   }
 
+  private encodeOutboundEnvelope(
+    session: InternalSession,
+    envelope: ControlEnvelope,
+  ): ControlEnvelope {
+    return session.versionAdapter?.encodeEnvelope
+      ? session.versionAdapter.encodeEnvelope(envelope)
+      : envelope;
+  }
+
   private buildSessionHead(session: InternalSession): MetaMap {
     const baseHead = session.treeStore.getHead();
-    return {
+    const rawHead: MetaMap = {
       ...baseHead,
       [HEAD_KEYS.PROTOCOL_VERSION]: session.protocolVersion,
       [HEAD_KEYS.SERVER_INFO]: this.serverInfo as unknown as AepValue,
@@ -761,6 +791,7 @@ export class AepServer {
       [HEAD_KEYS.ORIGIN_ID]: this.originId,
       [HEAD_KEYS.MOUNT_ORIGINS]: [this.originId, ...this.mountManager.getMountedOriginIds()],
     };
+    return session.versionAdapter?.adaptHead ? session.versionAdapter.adaptHead(rawHead) : rawHead;
   }
 
   private toSessionContext(session: InternalSession): ServerSessionContext {
@@ -810,7 +841,7 @@ export class AepServer {
       return;
     }
     try {
-      await session.transport.send(envelope);
+      await session.transport.send(this.encodeOutboundEnvelope(session, envelope));
     } catch {
       // Ignore send errors on closing transports
     }
@@ -826,18 +857,49 @@ export class AepServer {
 
     const replyTransport = session.transport;
     try {
-      const result = await this.dispatchRequest(session, envelope.method, envelope.params);
-      if ((!session.closed || envelope.method === "session.resume") && !replyTransport.isClosed) {
-        await replyTransport.send({
-          protocolVersion: session.protocolVersion,
-          kind: "response",
-          id: envelope.id,
-          ok: true,
-          result,
-        });
+      if (
+        (session.initialized || session.pendingAuth) &&
+        envelope.method !== "session.initialize" &&
+        envelope.method !== "session.resume" &&
+        envelope.protocolVersion !== session.protocolVersion
+      ) {
+        throw new AepError(
+          AEP_ERROR_CODES.UNSUPPORTED_VERSION,
+          `Envelope protocolVersion "${envelope.protocolVersion}" does not match negotiated session protocolVersion "${session.protocolVersion}"`,
+          {
+            expectedVersion: session.protocolVersion,
+            actualVersion: envelope.protocolVersion,
+            supportedVersions: [...this.supportedVersions],
+          },
+        );
+      }
+
+      const decodedEnvelope =
+        session.versionAdapter?.decodeEnvelope && envelope.method !== "session.initialize"
+          ? session.versionAdapter.decodeEnvelope(envelope)
+          : envelope;
+      if (decodedEnvelope.kind !== "request") {
+        throw new AepError(AEP_ERROR_CODES.INVALID_MESSAGE, "Decoded envelope is not a request");
+      }
+
+      const result = await this.dispatchRequest(
+        session,
+        decodedEnvelope.method,
+        decodedEnvelope.params,
+      );
+      if ((!session.closed || decodedEnvelope.method === "session.resume") && !replyTransport.isClosed) {
+        await replyTransport.send(
+          this.encodeOutboundEnvelope(session, {
+            protocolVersion: session.protocolVersion,
+            kind: "response",
+            id: decodedEnvelope.id,
+            ok: true,
+            result,
+          }),
+        );
       }
       if (
-        envelope.method === "session.resume" &&
+        decodedEnvelope.method === "session.resume" &&
         result &&
         typeof (result as { sessionId?: unknown }).sessionId === "string"
       ) {
@@ -849,7 +911,7 @@ export class AepServer {
         }
       }
       if (
-        envelope.method === "channel.open" &&
+        decodedEnvelope.method === "channel.open" &&
         result &&
         typeof (result as { subscriptionId?: unknown }).subscriptionId === "string"
       ) {
@@ -860,7 +922,7 @@ export class AepServer {
           await session.dataPlane.activateSubscription(subId);
         }
       }
-      if (envelope.method === "session.close") {
+      if (decodedEnvelope.method === "session.close") {
         session.explicitlyClosed = true;
         await this.cleanupSession(session, "Session closed by client");
       }
@@ -868,13 +930,15 @@ export class AepServer {
       const aepErr = AepError.from(err, AEP_ERROR_CODES.INTERNAL_ERROR);
       if (!session.closed && !replyTransport.isClosed) {
         try {
-          await replyTransport.send({
-            protocolVersion: session.protocolVersion,
-            kind: "response",
-            id: envelope.id,
-            ok: false,
-            error: aepErr.toJSON(),
-          });
+          await replyTransport.send(
+            this.encodeOutboundEnvelope(session, {
+              protocolVersion: session.protocolVersion,
+              kind: "response",
+              id: envelope.id,
+              ok: false,
+              error: aepErr.toJSON(),
+            }),
+          );
         } catch {
           // Ignore send errors on closed transport
         }
@@ -1077,23 +1141,33 @@ export class AepServer {
       !params.clientInfo ||
       typeof params.clientInfo.name !== "string" ||
       typeof params.clientInfo.version !== "string" ||
-      !Array.isArray(params.supportedVersions)
+      !Array.isArray(params.supportedVersions) ||
+      params.supportedVersions.length === 0 ||
+      params.supportedVersions.some((v) => typeof v !== "string" || v.length === 0)
     ) {
       throw new AepError(
         AEP_ERROR_CODES.INVALID_PARAMS,
-        "session.initialize requires clientInfo and supportedVersions",
+        "session.initialize requires clientInfo and a non-empty supportedVersions array",
       );
     }
 
-    const selectedVersion = params.supportedVersions.find((v) =>
-      this.supportedVersions.includes(v),
-    );
-    if (!selectedVersion) {
+    const negotiatedVersion = negotiateProtocolVersion(params.supportedVersions, {
+      supportedVersions: this.supportedVersions,
+      adapters: this.versionAdapters,
+      allowCompatibleMinor: this.allowCompatibleMinorVersions,
+    });
+    if (!negotiatedVersion) {
       throw new AepError(
         AEP_ERROR_CODES.UNSUPPORTED_VERSION,
         `No mutually supported protocol version among [${params.supportedVersions.join(", ")}]`,
+        {
+          supportedVersions: [...this.supportedVersions],
+          requestedVersions: [...params.supportedVersions],
+        },
       );
     }
+    const selectedVersion = negotiatedVersion.selectedVersion;
+    session.versionAdapter = negotiatedVersion.adapter;
 
     const requestedSecurity: SecurityDescriptor = params.security ?? {
       mode: "unauthenticated",
@@ -1118,7 +1192,10 @@ export class AepServer {
       );
     }
 
-    const negotiatedCaps = negotiateCapabilities(this.serverCapabilities, params.capabilities);
+    const rawNegotiatedCaps = negotiateCapabilities(this.serverCapabilities, params.capabilities);
+    const negotiatedCaps = session.versionAdapter?.adaptCapabilities
+      ? session.versionAdapter.adaptCapabilities(rawNegotiatedCaps)
+      : rawNegotiatedCaps;
 
     if (requestedSecurity.mode === "challenge-response") {
       if (!allowedModes.includes("challenge-response") && !this.securityOptions?.issueChallenge) {
@@ -1407,7 +1484,7 @@ export class AepServer {
     this.pendingResumes.set(target.sessionId, async () => {
       for (const env of missedNotifications) {
         if (!newTransport.isClosed) {
-          await newTransport.send(env);
+          await newTransport.send(this.encodeOutboundEnvelope(target, env));
         }
       }
       await target.dataPlane.rebindSessionSubscriptions(

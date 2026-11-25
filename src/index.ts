@@ -1,5 +1,6 @@
 export * from "./core/errors.js";
 export * from "./core/types.js";
+export * from "./core/version.js";
 export * from "./core/path.js";
 export * from "./core/profiles.js";
 export * from "./core/validation.js";

@@ -108,7 +108,7 @@ describe("Event Channels, Optimistic Concurrency, Leases, Node Moves, and Sessio
     const jsonCodec = new JsonTextCodec();
     const binCodec = new BinaryEnvelopeCodec();
     const eventNote = {
-      protocolVersion: "1.0.0-draft",
+      protocolVersion: "1.0.0-beta.0",
       kind: "notification" as const,
       method: "channel.chunk",
       seq: 3,

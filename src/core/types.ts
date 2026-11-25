@@ -1,6 +1,16 @@
 import type { AepErrorObject } from "./errors.js";
 
-export const AEP_PROTOCOL_VERSION = "1.0.0-draft";
+export const AEP_PROTOCOL_VERSION = "1.0.0-beta.0";
+export const AEP_SUPPORTED_PROTOCOL_VERSIONS = [AEP_PROTOCOL_VERSION] as const;
+export const AEP_WEBSOCKET_SUBPROTOCOL = "aep.v1";
+
+export interface UnsupportedVersionErrorData {
+  supportedVersions: string[];
+  requestedVersions?: string[];
+  expectedVersion?: string;
+  actualVersion?: string;
+  [key: string]: AepValue | string[] | undefined;
+}
 
 export const HEAD_KEYS = {
   PROTOCOL_VERSION: "aep.protocolVersion",

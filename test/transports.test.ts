@@ -118,7 +118,7 @@ describe("Transports and Codecs", () => {
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.PARSE_ERROR,
     );
     assert.throws(
-      () => jsonCodec.decode(JSON.stringify({ protocolVersion: "1.0.0-draft", kind: "weird" })),
+      () => jsonCodec.decode(JSON.stringify({ protocolVersion: "1.0.0-beta.0", kind: "weird" })),
       (err: unknown) => err instanceof AepError && err.code === AEP_ERROR_CODES.INVALID_MESSAGE,
     );
 
